@@ -1,0 +1,27 @@
+# Project Autopilot
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local tooling
+.opencode/
+.opencode/tools/__pycache__/
+
+# PA worktrees
+.worktrees/
+
+# PA artifacts
+ai/
+opencode.json
+
+# macOS
+.DS_Store
+session-*.md
+
+# Secrets
+.env
+.env.*
