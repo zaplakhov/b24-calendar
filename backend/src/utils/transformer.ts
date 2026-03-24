@@ -87,6 +87,23 @@ function formatDateForIcs(date: string, allDay: boolean): string {
   return parsed.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
 }
 
+function ensureAllDayEnd(startIso: string, endIso: string): string {
+  const startDate = new Date(startIso);
+  const endDate = new Date(endIso);
+
+  if (Number.isNaN(startDate.valueOf()) || Number.isNaN(endDate.valueOf())) {
+    return endIso;
+  }
+
+  if (endDate.valueOf() > startDate.valueOf()) {
+    return endIso;
+  }
+
+  const nextDay = new Date(startDate.valueOf());
+  nextDay.setUTCDate(nextDay.getUTCDate() + 1);
+  return nextDay.toISOString();
+}
+
 function extractIcsField(ics: string, fieldName: string): string | null {
   const unfolded = ics.replace(/\r\n[ \t]/g, '');
   const match = unfolded.match(new RegExp(`(?:^|\\n)${fieldName}(?:;[^:]+)?:([^\\n]+)`, 'i'));
@@ -180,17 +197,22 @@ export function buildBitrixEventFingerprint(event: BitrixCalendarEvent): string 
 }
 
 export function buildIcsEvent(draft: YandexCalendarDraft): string {
+  const normalizedEnd = draft.isAllDay ? ensureAllDayEnd(draft.startsAt, draft.endsAt) : draft.endsAt;
   const dtStamp = formatDateForIcs(draft.sourceUpdatedAt, false);
   const dtStart = formatDateForIcs(draft.startsAt, draft.isAllDay);
-  const dtEnd = formatDateForIcs(draft.endsAt, draft.isAllDay);
+  const dtEnd = formatDateForIcs(normalizedEnd, draft.isAllDay);
   const datePrefix = draft.isAllDay ? ';VALUE=DATE' : '';
   const lines = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
     'PRODID:-//b24-calendar//MVP//EN',
     'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
     'BEGIN:VEVENT',
     `UID:${escapeIcsValue(draft.uid)}`,
+    'SEQUENCE:0',
+    'STATUS:CONFIRMED',
+    'TRANSP:OPAQUE',
     `DTSTAMP:${dtStamp}`,
     `DTSTART${datePrefix}:${dtStart}`,
     `DTEND${datePrefix}:${dtEnd}`,

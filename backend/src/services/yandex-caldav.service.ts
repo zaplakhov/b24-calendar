@@ -56,6 +56,8 @@ export class YandexCalDavService {
     const calendar = await this.resolveSelectedCalendar(connectionId, client);
     const objects = await client.fetchCalendarObjects({
       calendar,
+      urlFilter: () => true,
+      useMultiGet: false,
     });
 
     return objects.map((item) => parseYandexCalendarObject(item.data ?? '', item.url, item.etag ?? null));
@@ -77,22 +79,23 @@ export class YandexCalDavService {
     const client = await this.createClient(connectionId);
     const calendar = await this.resolveSelectedCalendar(connectionId, client);
     const filename = `${draft.uid.replace(/[^a-zA-Z0-9_.-]/g, '-')}.ics`;
+    const iCalString = buildIcsEvent(draft);
     const response = await client.createCalendarObject({
       calendar,
       filename,
-      iCalString: buildIcsEvent(draft),
+      iCalString,
     });
 
     if (!response.ok) {
-      const rawResponse = await response.text().catch(() => '');
-      throw new Error(`Yandex CalDAV create failed with status ${response.status}. Raw response: ${rawResponse || 'empty body'}`);
+      const rawResponse = await this.readResponseBody(response);
+      throw new Error(`Yandex CalDAV create failed with status ${response.status}. Raw response: ${rawResponse}. ICS: ${iCalString}`);
     }
 
     const location = response.headers.get('location');
     const createdUrl = location ? new URL(location, calendar.url ?? undefined).toString() : `${calendar.url ?? ''}${filename}`;
-    const refreshed = await this.getEventByUrl(connectionId, createdUrl);
+    const refreshed = await this.getEventByUrl(connectionId, createdUrl).catch(() => null);
 
-    return refreshed ?? parseYandexCalendarObject(buildIcsEvent(draft), createdUrl, response.headers.get('etag'));
+    return refreshed ?? parseYandexCalendarObject(iCalString, createdUrl, response.headers.get('etag'));
   }
 
   public async updateEvent(connectionId: string, url: string, draft: YandexCalendarDraft): Promise<YandexCalendarEvent> {
@@ -103,19 +106,20 @@ export class YandexCalDavService {
       throw new Error(`Yandex calendar object ${url} was not found.`);
     }
 
+    const iCalString = buildIcsEvent(draft);
     const response = await client.updateCalendarObject({
       calendarObject: {
         ...existing,
-        data: buildIcsEvent(draft),
+        data: iCalString,
       },
     });
 
     if (!response.ok) {
-      const rawResponse = await response.text().catch(() => '');
-      throw new Error(`Yandex CalDAV update failed with status ${response.status}. Raw response: ${rawResponse || 'empty body'}`);
+      const rawResponse = await this.readResponseBody(response);
+      throw new Error(`Yandex CalDAV update failed with status ${response.status}. Raw response: ${rawResponse}. ICS: ${iCalString}`);
     }
 
-    return parseYandexCalendarObject(buildIcsEvent(draft), existing.url, response.headers.get('etag') ?? existing.etag ?? null);
+    return parseYandexCalendarObject(iCalString, existing.url, response.headers.get('etag') ?? existing.etag ?? null);
   }
 
   public async deleteEvent(connectionId: string, url: string): Promise<void> {
@@ -131,9 +135,18 @@ export class YandexCalDavService {
     });
 
     if (!response.ok) {
-      const rawResponse = await response.text().catch(() => '');
-      throw new Error(`Yandex CalDAV delete failed with status ${response.status}. Raw response: ${rawResponse || 'empty body'}`);
+      const rawResponse = await this.readResponseBody(response);
+      throw new Error(`Yandex CalDAV delete failed with status ${response.status}. Raw response: ${rawResponse}`);
     }
+  }
+
+  private async readResponseBody(response: Response): Promise<string> {
+    if (typeof response.text === 'function') {
+      const body = await response.text().catch(() => '');
+      return body || 'empty body';
+    }
+
+    return JSON.stringify(response);
   }
 
   private async createClient(connectionId: string) {
@@ -181,7 +194,8 @@ export class YandexCalDavService {
     const objects = await client.fetchCalendarObjects({
       calendar,
       objectUrls: [url],
-      useMultiGet: true,
+      urlFilter: () => true,
+      useMultiGet: false,
     });
 
     return objects.find((item) => item.url === url) ?? null;

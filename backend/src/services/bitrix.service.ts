@@ -57,6 +57,33 @@ function normalizeBitrixEvent(payload: BitrixPayload): BitrixCalendarEvent {
   };
 }
 
+function buildFallbackBitrixEvent(eventId: string, draft: BitrixCalendarDraft, calendarId: string | null): BitrixCalendarEvent {
+  const timestamp = new Date().toISOString();
+
+  return {
+    id: eventId,
+    calendarId,
+    title: draft.title,
+    description: draft.description,
+    startsAt: draft.startsAt,
+    endsAt: draft.endsAt,
+    timezone: null,
+    isAllDay: draft.isAllDay,
+    updatedAt: timestamp,
+    deleted: false,
+    recurrenceRule: null,
+    raw: {
+      ID: eventId,
+      NAME: draft.title,
+      DESCRIPTION: draft.description ?? '',
+      DATE_FROM: draft.startsAt,
+      DATE_TO: draft.endsAt,
+      SECT_ID: calendarId,
+      TIMESTAMP_X: timestamp,
+    },
+  };
+}
+
 export class BitrixService {
   public constructor(
     private readonly sqliteService: SQLiteService,
@@ -64,7 +91,13 @@ export class BitrixService {
   ) {}
 
   public async fetchCalendars(connectionId: string): Promise<PersistedCalendar[]> {
+    const context = this.sqliteService.getConnectionContext(connectionId);
+    if (!context) {
+      throw new Error(`Connection ${connectionId} was not found.`);
+    }
+
     const result = await this.call<unknown[]>(connectionId, 'calendar.section.get', {
+      ownerId: Number(context.connection.bitrixUserId),
       type: 'user',
     });
 
@@ -137,10 +170,16 @@ export class BitrixService {
     });
 
     if (typeof result === 'number' || typeof result === 'string') {
-      const event = await this.fetchEventById(connectionId, String(result));
-      if (event) {
-        return event;
+      try {
+        const event = await this.fetchEventById(connectionId, String(result));
+        if (event) {
+          return event;
+        }
+      } catch {
+        return buildFallbackBitrixEvent(String(result), draft, context.connection.bitrixCalendarId || null);
       }
+
+      return buildFallbackBitrixEvent(String(result), draft, context.connection.bitrixCalendarId || null);
     }
 
     return normalizeBitrixEvent((result ?? {}) as BitrixPayload);
@@ -164,12 +203,16 @@ export class BitrixService {
       skipTime: draft.isAllDay ? 'Y' : 'N',
     });
 
-    const refreshed = await this.fetchEventById(connectionId, eventId);
-    if (!refreshed) {
-      throw new Error(`Bitrix event ${eventId} was not returned after update.`);
+    try {
+      const refreshed = await this.fetchEventById(connectionId, eventId);
+      if (refreshed) {
+        return refreshed;
+      }
+    } catch {
+      return buildFallbackBitrixEvent(eventId, draft, context.connection.bitrixCalendarId || null);
     }
 
-    return refreshed;
+    return buildFallbackBitrixEvent(eventId, draft, context.connection.bitrixCalendarId || null);
   }
 
   public async deleteEvent(connectionId: string, eventId: string): Promise<void> {
@@ -201,6 +244,11 @@ export class BitrixService {
     });
 
     const envelope = (await response.json()) as BitrixResponseEnvelope<T>;
+    if (response.status === 503 && allowRefreshRetry) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return this.call<T>(connectionId, method, payload, false);
+    }
+
     if ((!response.ok || envelope.error) && allowRefreshRetry && this.isRefreshableBitrixError(response.status, envelope.error)) {
       await this.bitrixAuthService.refreshInstallationAuth(context.installation);
       return this.call<T>(connectionId, method, payload, false);
