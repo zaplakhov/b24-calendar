@@ -95,6 +95,23 @@ export interface SyncState {
   lastProcessedYandexEvents: number;
   lastSkippedRecurringEvents: number;
   lastOutcomeReason: string | null;
+  lastRunObservability: SyncRunObservability | null;
+}
+
+export interface SyncRunObservability {
+  counters: {
+    errorEvents: number;
+    healedMappings: number;
+    processedBitrixEvents: number;
+    processedYandexEvents: number;
+    skippedEvents: number;
+    skippedRecurringEvents: number;
+  };
+  reasonCodes: {
+    errors: string[];
+    healing: string[];
+    skipped: string[];
+  };
 }
 
 export interface EventMappingRecord {
@@ -107,6 +124,13 @@ export interface EventMappingRecord {
   targetFingerprint: string | null;
   bitrixUpdatedAt: string | null;
   yandexUpdatedAt: string | null;
+  sourceTimezone: string | null;
+  targetTimezone: string | null;
+  preservedPayload: Record<string, unknown> | null;
+  deferredReasonCodes: string[];
+  healingUrl: string | null;
+  lastHealingReason: string | null;
+  lastHealedAt: string | null;
   lastWinner: 'bitrix' | 'yandex' | null;
   lastDecisionReason: string | null;
   status: string;
@@ -172,6 +196,7 @@ interface SyncStateRow {
   last_processed_yandex_events: number | null;
   last_skipped_recurring_events: number | null;
   last_outcome_reason: string | null;
+  last_run_observability_json: string | null;
 }
 
 interface MappingRow {
@@ -184,6 +209,13 @@ interface MappingRow {
   target_fingerprint: string | null;
   bitrix_updated_at: string | null;
   yandex_updated_at: string | null;
+  source_timezone: string | null;
+  target_timezone: string | null;
+  preserved_payload_json: string | null;
+  deferred_reason_codes_json: string | null;
+  healing_url: string | null;
+  last_healing_reason: string | null;
+  last_healed_at: string | null;
   last_winner: 'bitrix' | 'yandex' | null;
   last_decision_reason: string | null;
   status: string;
@@ -208,6 +240,7 @@ const DEFAULT_SYNC_STATE: SyncState = {
   lastProcessedYandexEvents: 0,
   lastSkippedRecurringEvents: 0,
   lastOutcomeReason: null,
+  lastRunObservability: null,
 };
 
 function resolveDatabasePath(rawPath = process.env.SQLITE_DB_PATH): string {
@@ -232,6 +265,32 @@ function parseCalendarPayload(payload: string | null): Record<string, unknown> {
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
     return {};
+  }
+}
+
+function parseJsonObject(payload: string | null): Record<string, unknown> | null {
+  if (!payload) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(payload) as Record<string, unknown>;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonStringArray(payload: string | null): string[] {
+  if (!payload) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(payload) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
   }
 }
 
@@ -567,7 +626,7 @@ export class SQLiteService {
   public getSyncState(connectionId: string): SyncState {
     this.ensureScopedSyncState(connectionId);
     const row = this.database
-      .prepare<[string], SyncStateRow>('SELECT status, last_run_at, last_success_at, last_error_at, last_error_message, last_webhook_at, last_poll_at, active_direction, bitrix_sync_cursor, yandex_sync_cursor, polling_failure_count, last_processed_bitrix_events, last_processed_yandex_events, last_skipped_recurring_events, last_outcome_reason FROM connection_sync_state WHERE connection_id = ?')
+      .prepare<[string], SyncStateRow>('SELECT status, last_run_at, last_success_at, last_error_at, last_error_message, last_webhook_at, last_poll_at, active_direction, bitrix_sync_cursor, yandex_sync_cursor, polling_failure_count, last_processed_bitrix_events, last_processed_yandex_events, last_skipped_recurring_events, last_outcome_reason, last_run_observability_json FROM connection_sync_state WHERE connection_id = ?')
       .get(connectionId);
 
     if (!row) {
@@ -590,6 +649,7 @@ export class SQLiteService {
       lastProcessedYandexEvents: row.last_processed_yandex_events ?? 0,
       lastSkippedRecurringEvents: row.last_skipped_recurring_events ?? 0,
       lastOutcomeReason: row.last_outcome_reason,
+      lastRunObservability: parseJsonObject(row.last_run_observability_json) as SyncRunObservability | null,
     };
   }
 
@@ -610,14 +670,16 @@ export class SQLiteService {
               bitrix_sync_cursor = @bitrixSyncCursor,
               yandex_sync_cursor = @yandexSyncCursor,
              polling_failure_count = @pollingFailureCount,
-             last_processed_bitrix_events = @lastProcessedBitrixEvents,
-             last_processed_yandex_events = @lastProcessedYandexEvents,
-             last_skipped_recurring_events = @lastSkippedRecurringEvents,
-             last_outcome_reason = @lastOutcomeReason
+              last_processed_bitrix_events = @lastProcessedBitrixEvents,
+              last_processed_yandex_events = @lastProcessedYandexEvents,
+              last_skipped_recurring_events = @lastSkippedRecurringEvents,
+              last_outcome_reason = @lastOutcomeReason,
+              last_run_observability_json = @lastRunObservabilityJson
        WHERE connection_id = @connectionId`,
     ).run({
       connectionId,
       ...next,
+      lastRunObservabilityJson: next.lastRunObservability ? JSON.stringify(next.lastRunObservability) : null,
     });
 
     return next;
@@ -625,7 +687,7 @@ export class SQLiteService {
 
   public listEventMappings(connectionId: string): EventMappingRecord[] {
     const rows = this.database
-      .prepare<[string], MappingRow>("SELECT connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid, source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, last_winner, last_decision_reason, status, last_synced_at, deleted_at, deleted_by FROM connection_event_mappings WHERE connection_id = ? ORDER BY COALESCE(last_synced_at, deleted_at, '') DESC")
+      .prepare<[string], MappingRow>("SELECT connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid, source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, source_timezone, target_timezone, preserved_payload_json, deferred_reason_codes_json, healing_url, last_healing_reason, last_healed_at, last_winner, last_decision_reason, status, last_synced_at, deleted_at, deleted_by FROM connection_event_mappings WHERE connection_id = ? ORDER BY COALESCE(last_synced_at, deleted_at, '') DESC")
       .all(connectionId);
 
     return rows.map((row) => this.mapMappingRow(row));
@@ -633,7 +695,7 @@ export class SQLiteService {
 
   public getEventMappingByBitrixId(connectionId: string, bitrixEventId: string): EventMappingRecord | null {
     const row = this.database
-      .prepare<[string, string], MappingRow>('SELECT connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid, source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, last_winner, last_decision_reason, status, last_synced_at, deleted_at, deleted_by FROM connection_event_mappings WHERE connection_id = ? AND bitrix_event_id = ?')
+      .prepare<[string, string], MappingRow>('SELECT connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid, source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, source_timezone, target_timezone, preserved_payload_json, deferred_reason_codes_json, healing_url, last_healing_reason, last_healed_at, last_winner, last_decision_reason, status, last_synced_at, deleted_at, deleted_by FROM connection_event_mappings WHERE connection_id = ? AND bitrix_event_id = ?')
       .get(connectionId, bitrixEventId);
 
     return row ? this.mapMappingRow(row) : null;
@@ -641,8 +703,16 @@ export class SQLiteService {
 
   public getEventMappingByYandexUrl(connectionId: string, yandexEventUrl: string): EventMappingRecord | null {
     const row = this.database
-      .prepare<[string, string], MappingRow>('SELECT connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid, source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, last_winner, last_decision_reason, status, last_synced_at, deleted_at, deleted_by FROM connection_event_mappings WHERE connection_id = ? AND yandex_event_url = ?')
+      .prepare<[string, string], MappingRow>('SELECT connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid, source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, source_timezone, target_timezone, preserved_payload_json, deferred_reason_codes_json, healing_url, last_healing_reason, last_healed_at, last_winner, last_decision_reason, status, last_synced_at, deleted_at, deleted_by FROM connection_event_mappings WHERE connection_id = ? AND yandex_event_url = ?')
       .get(connectionId, yandexEventUrl);
+
+    return row ? this.mapMappingRow(row) : null;
+  }
+
+  public getEventMappingByYandexUid(connectionId: string, yandexEventUid: string): EventMappingRecord | null {
+    const row = this.database
+      .prepare<[string, string], MappingRow>("SELECT connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid, source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, source_timezone, target_timezone, preserved_payload_json, deferred_reason_codes_json, healing_url, last_healing_reason, last_healed_at, last_winner, last_decision_reason, status, last_synced_at, deleted_at, deleted_by FROM connection_event_mappings WHERE connection_id = ? AND yandex_event_uid = ? ORDER BY COALESCE(last_synced_at, deleted_at, '') DESC LIMIT 1")
+      .get(connectionId, yandexEventUid);
 
     return row ? this.mapMappingRow(row) : null;
   }
@@ -663,11 +733,18 @@ export class SQLiteService {
                target_fingerprint = @targetFingerprint,
                bitrix_updated_at = @bitrixUpdatedAt,
                yandex_updated_at = @yandexUpdatedAt,
-               last_winner = @lastWinner,
-               last_decision_reason = @lastDecisionReason,
-               status = @status,
-               last_synced_at = @lastSyncedAt,
-               deleted_at = @deletedAt,
+                source_timezone = @sourceTimezone,
+                target_timezone = @targetTimezone,
+                preserved_payload_json = @preservedPayloadJson,
+                deferred_reason_codes_json = @deferredReasonCodesJson,
+                healing_url = @healingUrl,
+                last_healing_reason = @lastHealingReason,
+                last_healed_at = @lastHealedAt,
+                last_winner = @lastWinner,
+                last_decision_reason = @lastDecisionReason,
+                status = @status,
+                last_synced_at = @lastSyncedAt,
+                deleted_at = @deletedAt,
                deleted_by = @deletedBy
          WHERE connection_id = @connectionId
            AND (
@@ -676,21 +753,31 @@ export class SQLiteService {
            )`,
       ).run({
         ...nextRecord,
+        deferredReasonCodesJson: JSON.stringify(nextRecord.deferredReasonCodes ?? []),
         existingBitrixEventId: existing.bitrixEventId,
         existingYandexEventUrl: existing.yandexEventUrl,
+        preservedPayloadJson: nextRecord.preservedPayload ? JSON.stringify(nextRecord.preservedPayload) : null,
       });
     } else {
       this.database.prepare(
         `INSERT INTO connection_event_mappings (
-           connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid,
-           source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, last_winner,
-           last_decision_reason, status, last_synced_at, deleted_at, deleted_by
-         ) VALUES (
-           @connectionId, @bitrixEventId, @yandexEventUrl, @yandexEventEtag, @yandexEventUid,
-           @sourceFingerprint, @targetFingerprint, @bitrixUpdatedAt, @yandexUpdatedAt, @lastWinner,
-           @lastDecisionReason, @status, @lastSyncedAt, @deletedAt, @deletedBy
-         )`,
-      ).run(nextRecord);
+            connection_id, bitrix_event_id, yandex_event_url, yandex_event_etag, yandex_event_uid,
+            source_fingerprint, target_fingerprint, bitrix_updated_at, yandex_updated_at, source_timezone,
+            target_timezone, preserved_payload_json, deferred_reason_codes_json, healing_url, last_healing_reason,
+            last_healed_at, last_winner,
+            last_decision_reason, status, last_synced_at, deleted_at, deleted_by
+          ) VALUES (
+            @connectionId, @bitrixEventId, @yandexEventUrl, @yandexEventEtag, @yandexEventUid,
+            @sourceFingerprint, @targetFingerprint, @bitrixUpdatedAt, @yandexUpdatedAt, @sourceTimezone,
+            @targetTimezone, @preservedPayloadJson, @deferredReasonCodesJson, @healingUrl, @lastHealingReason,
+            @lastHealedAt, @lastWinner,
+            @lastDecisionReason, @status, @lastSyncedAt, @deletedAt, @deletedBy
+          )`,
+      ).run({
+        ...nextRecord,
+        deferredReasonCodesJson: JSON.stringify(nextRecord.deferredReasonCodes ?? []),
+        preservedPayloadJson: nextRecord.preservedPayload ? JSON.stringify(nextRecord.preservedPayload) : null,
+      });
     }
 
     if (nextRecord.bitrixEventId) {
@@ -722,6 +809,7 @@ export class SQLiteService {
              last_success_at = NULL,
              last_error_at = NULL,
              last_error_message = NULL,
+             last_webhook_at = NULL,
              last_poll_at = NULL,
              active_direction = NULL,
              bitrix_sync_cursor = NULL,
@@ -730,7 +818,8 @@ export class SQLiteService {
              last_processed_bitrix_events = 0,
              last_processed_yandex_events = 0,
              last_skipped_recurring_events = 0,
-             last_outcome_reason = NULL
+             last_outcome_reason = NULL,
+             last_run_observability_json = NULL
        WHERE connection_id = ?`,
     ).run(connectionId);
   }
@@ -823,6 +912,13 @@ export class SQLiteService {
         target_fingerprint TEXT,
         bitrix_updated_at TEXT,
         yandex_updated_at TEXT,
+        source_timezone TEXT,
+        target_timezone TEXT,
+        preserved_payload_json TEXT,
+        deferred_reason_codes_json TEXT,
+        healing_url TEXT,
+        last_healing_reason TEXT,
+        last_healed_at TEXT,
         last_winner TEXT,
         last_decision_reason TEXT,
         status TEXT NOT NULL DEFAULT 'synced',
@@ -839,9 +935,14 @@ export class SQLiteService {
       CREATE UNIQUE INDEX IF NOT EXISTS connection_event_mappings_yandex_idx
       ON connection_event_mappings (connection_id, yandex_event_url)
       WHERE yandex_event_url IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS connection_event_mappings_yandex_uid_idx
+      ON connection_event_mappings (connection_id, yandex_event_uid)
+      WHERE yandex_event_uid IS NOT NULL;
     `);
 
     this.ensureConnectionSyncStateColumns();
+    this.ensureConnectionEventMappingColumns();
   }
 
   private ensureConnectionSyncStateColumns(): void {
@@ -850,6 +951,35 @@ export class SQLiteService {
     if (!columns.includes('bitrix_sync_cursor')) {
       this.database.exec('ALTER TABLE connection_sync_state ADD COLUMN bitrix_sync_cursor TEXT');
     }
+
+    if (!columns.includes('last_run_observability_json')) {
+      this.database.exec('ALTER TABLE connection_sync_state ADD COLUMN last_run_observability_json TEXT');
+    }
+  }
+
+  private ensureConnectionEventMappingColumns(): void {
+    const columns = this.database.prepare<[], { name: string }>('PRAGMA table_info(connection_event_mappings)').all().map((column) => column.name);
+    const additiveColumns: Array<{ name: string; sql: string }> = [
+      { name: 'source_timezone', sql: 'ALTER TABLE connection_event_mappings ADD COLUMN source_timezone TEXT' },
+      { name: 'target_timezone', sql: 'ALTER TABLE connection_event_mappings ADD COLUMN target_timezone TEXT' },
+      { name: 'preserved_payload_json', sql: 'ALTER TABLE connection_event_mappings ADD COLUMN preserved_payload_json TEXT' },
+      { name: 'deferred_reason_codes_json', sql: 'ALTER TABLE connection_event_mappings ADD COLUMN deferred_reason_codes_json TEXT' },
+      { name: 'healing_url', sql: 'ALTER TABLE connection_event_mappings ADD COLUMN healing_url TEXT' },
+      { name: 'last_healing_reason', sql: 'ALTER TABLE connection_event_mappings ADD COLUMN last_healing_reason TEXT' },
+      { name: 'last_healed_at', sql: 'ALTER TABLE connection_event_mappings ADD COLUMN last_healed_at TEXT' },
+    ];
+
+    for (const column of additiveColumns) {
+      if (!columns.includes(column.name)) {
+        this.database.exec(column.sql);
+      }
+    }
+
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS connection_event_mappings_yandex_uid_idx
+      ON connection_event_mappings (connection_id, yandex_event_uid)
+      WHERE yandex_event_uid IS NOT NULL;
+    `);
   }
 
   private ensureScopedSyncState(connectionId: string): void {
@@ -908,6 +1038,13 @@ export class SQLiteService {
       targetFingerprint: row.target_fingerprint,
       bitrixUpdatedAt: row.bitrix_updated_at,
       yandexUpdatedAt: row.yandex_updated_at,
+      sourceTimezone: row.source_timezone,
+      targetTimezone: row.target_timezone,
+      preservedPayload: parseJsonObject(row.preserved_payload_json),
+      deferredReasonCodes: parseJsonStringArray(row.deferred_reason_codes_json),
+      healingUrl: row.healing_url,
+      lastHealingReason: row.last_healing_reason,
+      lastHealedAt: row.last_healed_at,
       lastWinner: row.last_winner,
       lastDecisionReason: row.last_decision_reason,
       status: row.status,

@@ -22,15 +22,17 @@ import { resolveConflict } from '../utils/conflict-resolver';
 import {
   buildBitrixEventFingerprint,
   buildYandexEventFingerprint,
-  shouldSkipRecurrence,
+  normalizeBitrixEventForSync,
+  type NormalizationDescriptor,
+  type NormalizationReasonCode,
   transformBitrixEventToYandexDraft,
   transformYandexEventToBitrixDraft,
   type BitrixCalendarEvent,
   type YandexCalendarEvent,
 } from '../utils/transformer';
 import { BitrixService } from './bitrix.service';
-import { SQLiteService, type ConnectionSettings, type SyncState } from './sqlite.service';
-import { YandexCalDavService, YandexCalendarObjectNotFoundError } from './yandex-caldav.service';
+import { SQLiteService, type ConnectionSettings, type SyncRunObservability, type SyncState } from './sqlite.service';
+import { YandexCalDavService, YandexCalendarNormalizationError, YandexCalendarObjectNotFoundError } from './yandex-caldav.service';
 import { syncDebug, syncError, syncInfo, syncVerbose, syncWarn } from '../utils/sync-debug';
 
 export interface SyncStatusResponse {
@@ -48,8 +50,10 @@ export interface SyncStatusResponse {
     lastSyncAt: string | null;
     lastError: string | null;
     lastRun: {
+      counters: SyncRunObservability['counters'];
       processedBitrixEvents: number;
       processedYandexEvents: number;
+      reasonCodes: SyncRunObservability['reasonCodes'];
       skippedRecurringEvents: number;
       outcomeReason: string | null;
     };
@@ -88,31 +92,27 @@ interface WebhookDescriptor {
 type SyncExecutionPath = 'bitrix_webhook' | 'manual_sync' | 'scheduled_poll' | 'startup_initial' | 'settings_enabled';
 
 interface SyncExecutionStats {
+  observability: SyncRunObservability;
   processedBitrixEvents: number;
   processedYandexEvents: number;
   skippedRecurringEvents: number;
   outcomeReason: string;
 }
 
-function isBitrixEventDateInvalid(event: BitrixCalendarEvent): boolean {
-  const startMs = Date.parse(event.startsAt);
-  const endMs = Date.parse(event.endsAt);
+interface EventSyncResult {
+  healed?: boolean;
+  healingReason?: string;
+  reason?: string;
+  skipped: boolean;
+}
 
-  if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
-    return true;
-  }
-
-  const start = new Date(startMs);
-  const end = new Date(endMs);
-  if (start.getUTCFullYear() < 2000 || end.getUTCFullYear() < 2000) {
-    return true;
-  }
-
-  if (event.isAllDay) {
-    return endMs < startMs;
-  }
-
-  return endMs <= startMs;
+interface SyncRunObservabilityAccumulator {
+  counters: SyncRunObservability['counters'];
+  reasonCodes: {
+    errors: Set<string>;
+    healing: Set<string>;
+    skipped: Set<string>;
+  };
 }
 
 export class SyncService {
@@ -171,8 +171,10 @@ export class SyncService {
         lastSyncAt: state.lastSuccessAt,
         lastError: state.lastErrorMessage,
         lastRun: {
+          counters: state.lastRunObservability?.counters ?? this.createEmptyRunObservability().counters,
           processedBitrixEvents: state.lastProcessedBitrixEvents,
           processedYandexEvents: state.lastProcessedYandexEvents,
+          reasonCodes: state.lastRunObservability?.reasonCodes ?? this.createEmptyRunObservability().reasonCodes,
           skippedRecurringEvents: state.lastSkippedRecurringEvents,
           outcomeReason: state.lastOutcomeReason,
         },
@@ -249,6 +251,81 @@ export class SyncService {
     return this.getStatus(connectionId);
   }
 
+  private createEmptyRunObservability(): SyncRunObservability {
+    return {
+      counters: {
+        errorEvents: 0,
+        healedMappings: 0,
+        processedBitrixEvents: 0,
+        processedYandexEvents: 0,
+        skippedEvents: 0,
+        skippedRecurringEvents: 0,
+      },
+      reasonCodes: {
+        errors: [],
+        healing: [],
+        skipped: [],
+      },
+    };
+  }
+
+  private createObservabilityAccumulator(): SyncRunObservabilityAccumulator {
+    const empty = this.createEmptyRunObservability();
+    return {
+      counters: { ...empty.counters },
+      reasonCodes: {
+        errors: new Set<string>(),
+        healing: new Set<string>(),
+        skipped: new Set<string>(),
+      },
+    };
+  }
+
+  private finalizeObservability(accumulator: SyncRunObservabilityAccumulator): SyncRunObservability {
+    return {
+      counters: accumulator.counters,
+      reasonCodes: {
+        errors: [...accumulator.reasonCodes.errors],
+        healing: [...accumulator.reasonCodes.healing],
+        skipped: [...accumulator.reasonCodes.skipped],
+      },
+    };
+  }
+
+  private computeOutcomeReason(
+    baseReason: string,
+    hadSoftFailures: boolean,
+    observability: Pick<SyncRunObservability, 'counters'> | SyncRunObservabilityAccumulator,
+  ): string {
+    if (hadSoftFailures) {
+      return 'incremental_sync_completed_with_soft_failures';
+    }
+
+    if (observability.counters.healedMappings > 0) {
+      return 'incremental_sync_completed_with_healing';
+    }
+
+    return baseReason;
+  }
+
+  private noteSkip(accumulator: SyncRunObservabilityAccumulator, reason: NormalizationReasonCode | string): void {
+    accumulator.counters.skippedEvents += 1;
+    if (reason === 'recurrence_unsupported') {
+      accumulator.counters.skippedRecurringEvents += 1;
+    }
+    accumulator.reasonCodes.skipped.add(reason);
+  }
+
+  private noteError(accumulator: SyncRunObservabilityAccumulator, reason: string): void {
+    accumulator.counters.errorEvents += 1;
+    accumulator.reasonCodes.errors.add(reason);
+  }
+
+  private noteHealing(accumulator: SyncRunObservabilityAccumulator, reason: string): void {
+    accumulator.counters.healedMappings += 1;
+    accumulator.reasonCodes.healing.add(reason);
+  }
+
   private async runSchedulerIteration(trigger: 'startup_initial' | 'scheduled_poll'): Promise<void> {
     if (this.schedulerInFlight) {
       this.log('Scheduler iteration skipped because a previous iteration is still running.');
@@ -292,6 +369,7 @@ export class SyncService {
         trigger,
       });
       return {
+        observability: this.createEmptyRunObservability(),
         processedBitrixEvents: 0,
         processedYandexEvents: 0,
         skippedRecurringEvents: 0,
@@ -304,6 +382,7 @@ export class SyncService {
     if (!preflight.allowed) {
       this.applyNoopPreflight(connectionId, trigger, preflight);
       return {
+        observability: this.createEmptyRunObservability(),
         processedBitrixEvents: 0,
         processedYandexEvents: 0,
         skippedRecurringEvents: 0,
@@ -341,6 +420,7 @@ export class SyncService {
         lastOutcomeReason: stats.outcomeReason,
         lastProcessedBitrixEvents: stats.processedBitrixEvents,
         lastProcessedYandexEvents: stats.processedYandexEvents,
+        lastRunObservability: stats.observability,
         lastSkippedRecurringEvents: stats.skippedRecurringEvents,
         lastSuccessAt: new Date().toISOString(),
         pollingFailureCount: 0,
@@ -372,7 +452,9 @@ export class SyncService {
 
   private async runIncrementalSync(connectionId: string, previousState: SyncState, startedAt: string): Promise<SyncExecutionStats> {
     const bitrixEvents = await this.bitrixService.listEventsSince(connectionId, previousState.bitrixSyncCursor);
-    let skippedRecurringEvents = 0;
+    let hadSoftFailures = false;
+    const observability = this.createObservabilityAccumulator();
+    observability.counters.processedBitrixEvents = bitrixEvents.length;
 
     syncDebug({
       bitrixCursor: previousState.bitrixSyncCursor,
@@ -392,70 +474,126 @@ export class SyncService {
 
     for (const event of bitrixEvents) {
       try {
-        const skipped = await this.syncBitrixEvent(connectionId, event);
-        skippedRecurringEvents += skipped ? 1 : 0;
+        const result = await this.syncBitrixEvent(connectionId, event);
+        if (result.skipped && result.reason) {
+          this.noteSkip(observability, result.reason);
+        }
+        if (result.healed && result.healingReason) {
+          this.noteHealing(observability, result.healingReason);
+        }
       } catch (error: unknown) {
+        hadSoftFailures = true;
+        this.noteError(observability, 'bitrix_event_soft_failed');
         syncWarn('Bitrix event failed during sync and was skipped.', {
           connectionId,
           error: error instanceof Error ? error.message : 'Unknown error',
           eventId: event.id,
           phase: 'sync.bitrixEvent.error',
+          reason: 'bitrix_event_soft_failed',
         });
       }
     }
 
-    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, startedAt);
+    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, startedAt, observability);
+    hadSoftFailures = hadSoftFailures || yandexResult.hadSoftFailures;
 
     syncDebug({
       connectionId,
+      hadSoftFailures,
+      healedMappings: observability.counters.healedMappings,
       phase: 'sync.incremental.completed',
       processedBitrixEvents: bitrixEvents.length,
       processedYandexEvents: yandexResult.processedEvents,
-      skippedRecurringEvents: skippedRecurringEvents + yandexResult.skippedRecurringEvents,
+      skippedRecurringEvents: observability.counters.skippedRecurringEvents,
+    });
+
+    const outcomeReason = this.computeOutcomeReason('incremental_sync_completed', hadSoftFailures, observability);
+
+    syncInfo('[sync-operational] incremental summary', {
+      connectionId,
+      counters: observability.counters,
+      phase: 'sync.incremental.summary',
+      reasonCodes: this.finalizeObservability(observability).reasonCodes,
+      reason: outcomeReason,
     });
 
     return {
+      observability: this.finalizeObservability(observability),
       processedBitrixEvents: bitrixEvents.length,
       processedYandexEvents: yandexResult.processedEvents,
-      skippedRecurringEvents: skippedRecurringEvents + yandexResult.skippedRecurringEvents,
-      outcomeReason: 'incremental_sync_completed',
+      skippedRecurringEvents: observability.counters.skippedRecurringEvents,
+      outcomeReason,
     };
   }
 
   private async runWebhookAcceleratedSync(connectionId: string, payload: Record<string, unknown>, previousState: SyncState): Promise<SyncExecutionStats> {
     const descriptor = this.describeWebhookPayload(payload);
-    let skippedRecurringEvents = 0;
     let processedBitrixEvents = 0;
+    let hadSoftFailures = false;
+    const observability = this.createObservabilityAccumulator();
 
     if (descriptor.eventId) {
       if (descriptor.action === 'delete') {
         await this.handleBitrixDeletion(connectionId, descriptor.eventId);
         processedBitrixEvents = 1;
+        observability.counters.processedBitrixEvents = 1;
       } else {
         const event = await this.bitrixService.fetchEventById(connectionId, descriptor.eventId);
         if (event) {
           processedBitrixEvents = 1;
-          const skipped = await this.syncBitrixEvent(connectionId, event);
-          skippedRecurringEvents += skipped ? 1 : 0;
+          observability.counters.processedBitrixEvents = 1;
+          try {
+            const result = await this.syncBitrixEvent(connectionId, event);
+            if (result.skipped && result.reason) {
+              this.noteSkip(observability, result.reason);
+            }
+            if (result.healed && result.healingReason) {
+              this.noteHealing(observability, result.healingReason);
+            }
+          } catch (error: unknown) {
+            hadSoftFailures = true;
+            this.noteError(observability, 'bitrix_event_soft_failed');
+            syncWarn('Bitrix webhook event failed during sync and was skipped.', {
+              connectionId,
+              error: error instanceof Error ? error.message : 'Unknown error',
+              eventId: event.id,
+              phase: 'sync.bitrixWebhook.error',
+              reason: 'bitrix_event_soft_failed',
+            });
+          }
         }
       }
     }
 
-    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, new Date().toISOString());
+    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, new Date().toISOString(), observability);
+    hadSoftFailures = hadSoftFailures || yandexResult.hadSoftFailures;
+    const outcomeReason = this.computeOutcomeReason(
+      descriptor.action === 'delete' ? 'bitrix_webhook_delete_processed' : 'bitrix_webhook_upsert_processed',
+      hadSoftFailures,
+      observability,
+    );
 
     return {
+      observability: this.finalizeObservability(observability),
       processedBitrixEvents,
       processedYandexEvents: yandexResult.processedEvents,
-      skippedRecurringEvents: skippedRecurringEvents + yandexResult.skippedRecurringEvents,
-      outcomeReason: descriptor.action === 'delete' ? 'bitrix_webhook_delete_processed' : 'bitrix_webhook_upsert_processed',
+      skippedRecurringEvents: observability.counters.skippedRecurringEvents,
+      outcomeReason,
     };
   }
 
-  private async runYandexIncrementalInternal(connectionId: string, previousState: SyncState, startedAt: string): Promise<{ processedEvents: number; skippedRecurringEvents: number }> {
-    const events = await this.yandexService.listEvents(connectionId);
-    const currentUrls = new Set(events.map((event) => event.url));
+  private async runYandexIncrementalInternal(
+    connectionId: string,
+    previousState: SyncState,
+    startedAt: string,
+    observability: SyncRunObservabilityAccumulator,
+  ): Promise<{ processedEvents: number; skippedRecurringEvents: number; hadSoftFailures: boolean; healedMappings: number }> {
+    const results = await this.yandexService.listEventResults(connectionId);
+    const events = results.filter((result): result is { ok: true; value: YandexCalendarEvent } => result.ok).map((result) => result.value);
+    const observedUrls = new Set(events.map((event) => event.url));
     let processedEvents = 0;
-    let skippedRecurringEvents = 0;
+    let hadSoftFailures = false;
+    observability.counters.processedYandexEvents = 0;
 
     syncDebug({
       connectionId,
@@ -472,20 +610,41 @@ export class SyncService {
       yandexCursor: previousState.yandexSyncCursor,
     });
 
-    for (const event of events) {
+    for (const result of results) {
+      if (!result.ok) {
+        hadSoftFailures = true;
+        const observedUrl = this.getNormalizationDetailString(result.issue, 'url');
+        if (observedUrl) {
+          observedUrls.add(observedUrl);
+        }
+        this.noteSkip(observability, result.issue.reason);
+        this.logNormalizationIssue(connectionId, 'sync.yandexEvent.skip', result.issue);
+        continue;
+      }
+
+      const event = result.value;
       if (!this.shouldProcessYandexEvent(connectionId, event, previousState.yandexSyncCursor)) {
         continue;
       }
 
       processedEvents += 1;
+      observability.counters.processedYandexEvents = processedEvents;
       try {
-        const skipped = await this.syncYandexEvent(connectionId, event);
-        skippedRecurringEvents += skipped ? 1 : 0;
+        const outcome = await this.syncYandexEvent(connectionId, event);
+        if (outcome.skipped && outcome.reason) {
+          this.noteSkip(observability, outcome.reason);
+        }
+        if (outcome.healed && outcome.healingReason) {
+          this.noteHealing(observability, outcome.healingReason);
+        }
       } catch (error: unknown) {
+        hadSoftFailures = true;
+        this.noteError(observability, 'yandex_event_soft_failed');
         syncWarn('Yandex event failed during sync and was skipped.', {
           connectionId,
           error: error instanceof Error ? error.message : 'Unknown error',
           phase: 'sync.yandexEvent.error',
+          reason: 'yandex_event_soft_failed',
           uid: event.uid,
           url: event.url,
         });
@@ -494,7 +653,36 @@ export class SyncService {
 
     const mappings = this.sqliteService.listEventMappings(connectionId);
     for (const mapping of mappings) {
-      if (!mapping.yandexEventUrl || currentUrls.has(mapping.yandexEventUrl) || mapping.status === 'deleted') {
+      if (!mapping.yandexEventUrl || observedUrls.has(mapping.yandexEventUrl) || mapping.status === 'deleted') {
+        continue;
+      }
+
+      const healedEvent = mapping.yandexEventUid ? events.find((event) => event.uid === mapping.yandexEventUid) ?? null : null;
+      if (healedEvent) {
+        this.noteHealing(observability, 'yandex_mapping_healed_by_uid');
+        this.sqliteService.upsertEventMapping({
+          ...mapping,
+          deferredReasonCodes: mapping.deferredReasonCodes,
+          healingUrl: mapping.yandexEventUrl,
+          lastDecisionReason: 'yandex_mapping_healed_by_uid',
+          lastHealedAt: startedAt,
+          lastHealingReason: 'yandex_mapping_healed_by_uid',
+          lastSyncedAt: startedAt,
+          preservedPayload: mapping.preservedPayload,
+          sourceTimezone: mapping.sourceTimezone,
+          targetTimezone: healedEvent.timezone,
+          yandexEventEtag: healedEvent.etag,
+          yandexEventUid: healedEvent.uid,
+          yandexEventUrl: healedEvent.url,
+          yandexUpdatedAt: healedEvent.updatedAt,
+        });
+        syncWarn('Yandex mapping healed after URL drift.', {
+          connectionId,
+          healedUrl: healedEvent.url,
+          phase: 'sync.yandexMapping.healed',
+          previousUrl: mapping.yandexEventUrl,
+          reason: 'yandex_mapping_healed_by_uid',
+        });
         continue;
       }
 
@@ -514,13 +702,16 @@ export class SyncService {
     }
 
     return {
+      hadSoftFailures,
+      healedMappings: observability.counters.healedMappings,
       processedEvents,
-      skippedRecurringEvents,
+      skippedRecurringEvents: observability.counters.skippedRecurringEvents,
     };
   }
 
   private shouldProcessYandexEvent(connectionId: string, event: YandexCalendarEvent, cursor: string | null): boolean {
-    const mapping = this.sqliteService.getEventMappingByYandexUrl(connectionId, event.url);
+    const mapping = this.sqliteService.getEventMappingByYandexUrl(connectionId, event.url)
+      ?? (event.uid ? this.sqliteService.getEventMappingByYandexUid(connectionId, event.uid) : null);
     if (!mapping) {
       return true;
     }
@@ -539,7 +730,7 @@ export class SyncService {
     return !Number.isNaN(updatedAtMs) && !Number.isNaN(cursorMs) && updatedAtMs > cursorMs;
   }
 
-  private async syncBitrixEvent(connectionId: string, event: BitrixCalendarEvent): Promise<boolean> {
+  private async syncBitrixEvent(connectionId: string, event: BitrixCalendarEvent): Promise<EventSyncResult> {
     const selectedCalendarId = this.sqliteService.getConnectionById(connectionId)?.bitrixCalendarId ?? null;
     syncDebug({
       connectionId,
@@ -556,39 +747,17 @@ export class SyncService {
       selectedCalendarId,
     });
 
-    if (shouldSkipRecurrence(event)) {
-      this.noteRecurringSkip(connectionId, `Skipped Bitrix event ${event.id}: recurring events are unsupported in MVP.`);
-      syncWarn('Bitrix event skipped due to recurrence.', {
-        connectionId,
-        eventId: event.id,
-        phase: 'sync.bitrixEvent.skip',
-        reason: 'recurrence_unsupported',
-      });
-      return true;
-    }
+    const normalized = normalizeBitrixEventForSync(event, selectedCalendarId);
+    if (!normalized.ok) {
+      if (normalized.issue.reason === 'recurrence_unsupported') {
+        this.noteRecurringSkip(connectionId, `Skipped Bitrix event ${event.id}: recurring events are unsupported in MVP.`);
+      }
 
-    if (selectedCalendarId && event.calendarId && event.calendarId !== selectedCalendarId) {
-      syncWarn('Bitrix event skipped due to section mismatch.', {
-        connectionId,
-        eventCalendarId: event.calendarId,
-        eventId: event.id,
-        phase: 'sync.bitrixEvent.skip',
-        reason: 'section_mismatch',
-        selectedCalendarId,
-      });
-      return true;
-    }
-
-    if (isBitrixEventDateInvalid(event)) {
-      syncWarn('Bitrix event skipped due to invalid dates.', {
-        connectionId,
-        endsAt: event.endsAt,
-        eventId: event.id,
-        phase: 'sync.bitrixEvent.skip',
-        reason: 'invalid_dates',
-        startsAt: event.startsAt,
-      });
-      return true;
+      this.logNormalizationIssue(connectionId, 'sync.bitrixEvent.skip', normalized.issue, { eventId: event.id });
+      return {
+        reason: normalized.issue.reason,
+        skipped: true,
+      };
     }
 
     const mapping = this.sqliteService.getEventMappingByBitrixId(connectionId, event.id);
@@ -613,12 +782,12 @@ export class SyncService {
     });
 
     if (decision.action === 'skip') {
-      return false;
+      return { skipped: false };
     }
 
     if (decision.action === 'delete') {
       await this.handleBitrixDeletion(connectionId, event.id);
-      return false;
+      return { skipped: false };
     }
 
     const draft = transformBitrixEventToYandexDraft(event);
@@ -628,6 +797,7 @@ export class SyncService {
       eventId: event.id,
       phase: 'sync.bitrixToYandex.request',
     });
+    let healed = false;
     let syncedEvent;
 
     if (decision.action === 'create' || !mapping?.yandexEventUrl) {
@@ -637,14 +807,18 @@ export class SyncService {
         syncedEvent = await this.yandexService.updateEvent(connectionId, mapping.yandexEventUrl, draft);
       } catch (error: unknown) {
         if (error instanceof YandexCalendarObjectNotFoundError) {
-          syncWarn('Detected stale Yandex mapping, deleting and recreating object.', {
+          const healedEvent = mapping.yandexEventUid ? await this.yandexService.findEventByUid(connectionId, mapping.yandexEventUid) : null;
+          healed = true;
+          syncWarn('Detected stale Yandex mapping, attempting healing.', {
             bitrixEventId: event.id,
             connectionId,
             phase: 'sync.bitrixToYandex.staleMapping',
+            reason: healedEvent ? 'stale_mapping_rebound' : 'stale_mapping_recreated',
             staleUrl: mapping.yandexEventUrl,
           });
-          this.sqliteService.deleteEventMappingByBitrixId(connectionId, event.id);
-          syncedEvent = await this.yandexService.createEvent(connectionId, draft);
+          syncedEvent = healedEvent
+            ? await this.yandexService.updateEvent(connectionId, healedEvent.url, draft)
+            : await this.yandexService.createEvent(connectionId, draft);
         } else {
           throw error;
         }
@@ -662,13 +836,23 @@ export class SyncService {
       connectionId,
       bitrixEventId: event.id,
       bitrixUpdatedAt: event.updatedAt,
+      deferredReasonCodes: draft.preserved.deferredReasonCodes,
       deletedAt: null,
       deletedBy: null,
+      healingUrl: healed ? mapping?.yandexEventUrl ?? null : null,
       lastDecisionReason: decision.reason,
+      lastHealedAt: healed ? new Date().toISOString() : mapping?.lastHealedAt ?? null,
+      lastHealingReason: healed ? 'stale_mapping_healed' : mapping?.lastHealingReason ?? null,
       lastSyncedAt: new Date().toISOString(),
       lastWinner: 'bitrix',
+      preservedPayload: {
+        source: event.preserved,
+        target: draft.preserved,
+      },
       sourceFingerprint: fingerprint,
+      sourceTimezone: event.timezone,
       status: 'synced',
+      targetTimezone: syncedEvent.timezone,
       targetFingerprint: buildYandexEventFingerprint(syncedEvent),
       yandexUpdatedAt: syncedEvent.updatedAt,
       yandexEventEtag: syncedEvent.etag,
@@ -676,10 +860,14 @@ export class SyncService {
       yandexEventUrl: syncedEvent.url,
     });
 
-    return false;
+    return {
+      healed,
+      healingReason: healed ? 'stale_mapping_healed' : undefined,
+      skipped: false,
+    };
   }
 
-  private async syncYandexEvent(connectionId: string, event: YandexCalendarEvent): Promise<boolean> {
+  private async syncYandexEvent(connectionId: string, event: YandexCalendarEvent): Promise<EventSyncResult> {
     syncDebug({
       connectionId,
       event: {
@@ -694,19 +882,18 @@ export class SyncService {
       phase: 'sync.yandexEvent.inspect',
     });
 
-    if (shouldSkipRecurrence(event)) {
+    if (event.recurrenceRule) {
       this.noteRecurringSkip(connectionId, `Skipped Yandex event ${event.uid}: recurring events are unsupported in MVP.`);
-      syncWarn('Yandex event skipped due to recurrence.', {
-        connectionId,
-        phase: 'sync.yandexEvent.skip',
+      this.logNormalizationIssue(connectionId, 'sync.yandexEvent.skip', {
+        kind: 'skip',
+        provider: 'yandex',
         reason: 'recurrence_unsupported',
-        uid: event.uid,
-        url: event.url,
-      });
-      return true;
+      }, { uid: event.uid, url: event.url });
+      return { reason: 'recurrence_unsupported', skipped: true };
     }
 
-    const mapping = this.sqliteService.getEventMappingByYandexUrl(connectionId, event.url);
+    const mapping = this.sqliteService.getEventMappingByYandexUrl(connectionId, event.url)
+      ?? (event.uid ? this.sqliteService.getEventMappingByYandexUid(connectionId, event.uid) : null);
     const fingerprint = buildYandexEventFingerprint(event);
     const decision = resolveConflict({
       sourceProvider: 'yandex',
@@ -729,7 +916,7 @@ export class SyncService {
     });
 
     if (decision.action === 'skip') {
-      return false;
+      return { skipped: false };
     }
 
     const draft = transformYandexEventToBitrixDraft(event);
@@ -756,13 +943,23 @@ export class SyncService {
       connectionId,
       bitrixEventId: syncedEvent.id,
       bitrixUpdatedAt: syncedEvent.updatedAt,
+      deferredReasonCodes: draft.preserved?.deferredReasonCodes ?? [],
       deletedAt: null,
       deletedBy: null,
+      healingUrl: mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url ? mapping.yandexEventUrl : null,
       lastDecisionReason: decision.reason,
+      lastHealedAt: mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url ? new Date().toISOString() : mapping?.lastHealedAt ?? null,
+      lastHealingReason: mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url ? 'yandex_url_rebound' : mapping?.lastHealingReason ?? null,
       lastSyncedAt: new Date().toISOString(),
       lastWinner: 'yandex',
+      preservedPayload: {
+        source: event.preserved,
+        target: draft.preserved ?? null,
+      },
       sourceFingerprint: buildBitrixEventFingerprint(syncedEvent),
+      sourceTimezone: syncedEvent.timezone,
       status: 'synced',
+      targetTimezone: event.timezone,
       targetFingerprint: fingerprint,
       yandexUpdatedAt: event.updatedAt,
       yandexEventEtag: event.etag,
@@ -770,7 +967,11 @@ export class SyncService {
       yandexEventUrl: event.url,
     });
 
-    return false;
+    return {
+      healed: Boolean(mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url),
+      healingReason: mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url ? 'yandex_url_rebound' : undefined,
+      skipped: false,
+    };
   }
 
   private async handleBitrixDeletion(connectionId: string, eventId: string): Promise<void> {
@@ -785,13 +986,20 @@ export class SyncService {
       connectionId,
       bitrixEventId: eventId,
       bitrixUpdatedAt: deletedAt,
+      deferredReasonCodes: mapping?.deferredReasonCodes ?? [],
       deletedAt,
       deletedBy: 'bitrix',
+      healingUrl: mapping?.healingUrl ?? null,
       lastDecisionReason: 'source_deleted',
+      lastHealedAt: mapping?.lastHealedAt ?? null,
+      lastHealingReason: mapping?.lastHealingReason ?? null,
       lastSyncedAt: deletedAt,
       lastWinner: 'bitrix',
+      preservedPayload: mapping?.preservedPayload ?? null,
       sourceFingerprint: mapping?.sourceFingerprint ?? null,
+      sourceTimezone: mapping?.sourceTimezone ?? null,
       status: 'deleted',
+      targetTimezone: mapping?.targetTimezone ?? null,
       targetFingerprint: mapping?.targetFingerprint ?? null,
       yandexUpdatedAt: mapping?.yandexUpdatedAt ?? null,
       yandexEventEtag: mapping?.yandexEventEtag ?? null,
@@ -929,6 +1137,27 @@ export class SyncService {
       lastSkippedRecurringEvents: currentState.lastSkippedRecurringEvents + 1,
       status: 'success',
     });
+  }
+
+  private logNormalizationIssue(
+    connectionId: string,
+    phase: string,
+    issue: NormalizationDescriptor,
+    extra?: Record<string, unknown>,
+  ): void {
+    syncWarn('Calendar event skipped by normalization contract.', {
+      connectionId,
+      phase,
+      reason: issue.reason,
+      provider: issue.provider,
+      ...issue.details,
+      ...extra,
+    });
+  }
+
+  private getNormalizationDetailString(issue: NormalizationDescriptor, key: string): string | null {
+    const value = issue.details?.[key];
+    return typeof value === 'string' && value.length > 0 ? value : null;
   }
 
   private scheduleNextPoll(schedule: PollingSchedule): void {
