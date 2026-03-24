@@ -39,8 +39,8 @@ import { SyncService } from './services/sync.service';
 import { YandexCalDavService } from './services/yandex-caldav.service';
 
 const DEFAULT_PORT = 3000;
-const DEFAULT_POLL_MINUTES_MIN = 10;
-const DEFAULT_POLL_MINUTES_MAX = 15;
+const DEFAULT_POLL_MINUTES_MIN = 5;
+const DEFAULT_POLL_MINUTES_MAX = 5;
 
 interface AppDependencies {
   sqliteService: SQLiteService;

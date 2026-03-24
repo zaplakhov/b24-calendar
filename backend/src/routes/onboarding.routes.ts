@@ -109,6 +109,10 @@ export function createOnboardingRouter(dependencies: OnboardingRouterDependencie
   router.put('/:token', (request: Request, response: Response) => {
     const context = resolveContext(sqliteService, request.params.token);
     const nextSettings = sqliteService.updateConnectionSettings(context.connection.id, normalizeSettingsPatch(request.body));
+    if (nextSettings.syncEnabled && !context.connection.syncEnabled) {
+      syncService.requestImmediateSync(context.connection.id, 'settings_enabled');
+    }
+
     response.status(200).json({
       message: 'Settings saved.',
       credentials: {
@@ -163,7 +167,7 @@ export function createOnboardingRouter(dependencies: OnboardingRouterDependencie
   router.post('/:token/sync/run', async (request: Request, response: Response, next) => {
     try {
       const context = resolveContext(sqliteService, request.params.token);
-      const result = await syncService.runManualResync(context.connection.id);
+      const result = await syncService.runManualSyncNow(context.connection.id);
       response.status(200).json({
         error: null,
         noop: result.noop,

@@ -80,7 +80,7 @@ function fillSettings(response) {
   renderSelect(fields.yandexCalendarUrl, state.calendars.yandex, settings.yandexCalendarUrl || '', 'url');
 
   runtimeStatus.textContent = JSON.stringify(status, null, 2);
-  connectionStatus.textContent = status.configured ? 'Готово к sync' : 'Требуются настройки';
+  connectionStatus.textContent = status.configured ? 'Готово к синхронизации' : 'Требуются настройки';
   lastSyncValue.textContent = runtimeState.lastSuccessAt || runtimeState.lastRunAt || 'Никогда';
   lastErrorValue.textContent = runtimeState.lastErrorMessage || 'Нет';
   portalValue.textContent = response.installation?.portalHost || '-';
@@ -88,12 +88,12 @@ function fillSettings(response) {
   portalCaption.textContent = `${response.installation?.portalHost || 'Портал'} · пользователь ${bitrixUserValue.textContent}`;
 
   if (response.configured) {
-    setBanner('Подключение настроено. Можно запускать синхронизацию и проверку.', 'success');
+    setBanner('Подключение настроено. Автоматический sync выполняется каждые 5 минут, а кнопку можно использовать для мгновенной проверки.', 'success');
     return;
   }
 
   if (response.credentials?.yandexPasswordSaved) {
-    setBanner('Пароль приложения Яндекс сохранен на сервере. Осталось выбрать календари и при необходимости включить sync.');
+    setBanner('Пароль приложения Яндекс сохранен на сервере. Осталось выбрать календари и при необходимости включить синхронизацию.');
     return;
   }
 
@@ -163,14 +163,14 @@ async function loadCalendars(provider) {
 }
 
 async function triggerSync() {
-  setBanner('Запуск синхронизации...');
+  setBanner('Запуск синхронизации только по новым изменениям...');
   const payload = await fetchJson(endpoint('/sync/run'), {
     body: JSON.stringify({}),
     method: 'POST',
   });
 
   runtimeStatus.textContent = JSON.stringify(payload.result?.status || payload.status || payload, null, 2);
-  setBanner('Ручная синхронизация завершена.', 'success');
+  setBanner('Ручной sync по новым изменениям завершен.', 'success');
 }
 
 settingsForm.addEventListener('submit', (event) => {

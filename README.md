@@ -16,7 +16,7 @@
 - per-user connections в SQLite
 - scoped sync state и event mappings по connection
 - загрузка календарей Bitrix24 и Яндекс для каждой connection
-- ручная ресинхронизация и background polling
+- ручной sync-now по новым изменениям и background polling каждые 5 минут
 - Dockerfile для деплоя на VPS / Coolify
 
 ## Архитектура
@@ -111,7 +111,7 @@ docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calen
 - `GET /api/onboarding/:token/bitrix/calendars` -> загрузить календари Bitrix24
 - `GET /api/onboarding/:token/yandex/calendars` -> загрузить календари Яндекс
 - `GET /api/onboarding/:token/sync/status` -> статус sync
-- `POST /api/onboarding/:token/sync/run` -> ручная ресинхронизация
+- `POST /api/onboarding/:token/sync/run` -> ручной sync-now по новым изменениям
 
 ### Runtime
 
@@ -141,5 +141,12 @@ docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calen
 3. Откройте `/connect/` и выполните OAuth для пользователя портала.
 4. На `/onboarding/:token` загрузите календари Bitrix24 и Яндекс.
 5. Сохраните настройки и включите sync.
-6. Запустите `POST /api/onboarding/:token/sync/run` или кнопку ручной ресинхронизации.
+6. Запустите `POST /api/onboarding/:token/sync/run` или кнопку `Синхронизировать сейчас`.
 7. Проверьте, что статусы и reviewer evidence обновляются.
+
+## Поведение синхронизации
+
+- Автоматический polling работает в обе стороны каждые 5 минут.
+- После первого включения `syncEnabled` сервис сразу запускает initial sync для connection.
+- Кнопка `Синхронизировать сейчас` запускает тот же incremental pipeline немедленно и не должна выполнять отдельную полную пересборку календаря.
+- Bitrix webhook остается дополнительным ускорителем, но больше не является обязательным условием для работы Bitrix -> Yandex.

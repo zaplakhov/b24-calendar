@@ -88,6 +88,7 @@ export interface SyncState {
   lastWebhookAt: string | null;
   lastPollAt: string | null;
   activeDirection: string | null;
+  bitrixSyncCursor: string | null;
   yandexSyncCursor: string | null;
   pollingFailureCount: number;
   lastProcessedBitrixEvents: number;
@@ -164,6 +165,7 @@ interface SyncStateRow {
   last_webhook_at: string | null;
   last_poll_at: string | null;
   active_direction: string | null;
+  bitrix_sync_cursor: string | null;
   yandex_sync_cursor: string | null;
   polling_failure_count: number | null;
   last_processed_bitrix_events: number | null;
@@ -199,6 +201,7 @@ const DEFAULT_SYNC_STATE: SyncState = {
   lastWebhookAt: null,
   lastPollAt: null,
   activeDirection: null,
+  bitrixSyncCursor: null,
   yandexSyncCursor: null,
   pollingFailureCount: 0,
   lastProcessedBitrixEvents: 0,
@@ -564,7 +567,7 @@ export class SQLiteService {
   public getSyncState(connectionId: string): SyncState {
     this.ensureScopedSyncState(connectionId);
     const row = this.database
-      .prepare<[string], SyncStateRow>('SELECT status, last_run_at, last_success_at, last_error_at, last_error_message, last_webhook_at, last_poll_at, active_direction, yandex_sync_cursor, polling_failure_count, last_processed_bitrix_events, last_processed_yandex_events, last_skipped_recurring_events, last_outcome_reason FROM connection_sync_state WHERE connection_id = ?')
+      .prepare<[string], SyncStateRow>('SELECT status, last_run_at, last_success_at, last_error_at, last_error_message, last_webhook_at, last_poll_at, active_direction, bitrix_sync_cursor, yandex_sync_cursor, polling_failure_count, last_processed_bitrix_events, last_processed_yandex_events, last_skipped_recurring_events, last_outcome_reason FROM connection_sync_state WHERE connection_id = ?')
       .get(connectionId);
 
     if (!row) {
@@ -580,6 +583,7 @@ export class SQLiteService {
       lastWebhookAt: row.last_webhook_at,
       lastPollAt: row.last_poll_at,
       activeDirection: row.active_direction,
+      bitrixSyncCursor: row.bitrix_sync_cursor,
       yandexSyncCursor: row.yandex_sync_cursor,
       pollingFailureCount: row.polling_failure_count ?? 0,
       lastProcessedBitrixEvents: row.last_processed_bitrix_events ?? 0,
@@ -600,10 +604,11 @@ export class SQLiteService {
              last_success_at = @lastSuccessAt,
              last_error_at = @lastErrorAt,
              last_error_message = @lastErrorMessage,
-             last_webhook_at = @lastWebhookAt,
-             last_poll_at = @lastPollAt,
-             active_direction = @activeDirection,
-             yandex_sync_cursor = @yandexSyncCursor,
+              last_webhook_at = @lastWebhookAt,
+              last_poll_at = @lastPollAt,
+              active_direction = @activeDirection,
+              bitrix_sync_cursor = @bitrixSyncCursor,
+              yandex_sync_cursor = @yandexSyncCursor,
              polling_failure_count = @pollingFailureCount,
              last_processed_bitrix_events = @lastProcessedBitrixEvents,
              last_processed_yandex_events = @lastProcessedYandexEvents,
@@ -767,6 +772,7 @@ export class SQLiteService {
         last_webhook_at TEXT,
         last_poll_at TEXT,
         active_direction TEXT,
+        bitrix_sync_cursor TEXT,
         yandex_sync_cursor TEXT,
         polling_failure_count INTEGER NOT NULL DEFAULT 0,
         last_processed_bitrix_events INTEGER NOT NULL DEFAULT 0,
@@ -803,6 +809,16 @@ export class SQLiteService {
       ON connection_event_mappings (connection_id, yandex_event_url)
       WHERE yandex_event_url IS NOT NULL;
     `);
+
+    this.ensureConnectionSyncStateColumns();
+  }
+
+  private ensureConnectionSyncStateColumns(): void {
+    const columns = this.database.prepare<[], { name: string }>('PRAGMA table_info(connection_sync_state)').all().map((column) => column.name);
+
+    if (!columns.includes('bitrix_sync_cursor')) {
+      this.database.exec('ALTER TABLE connection_sync_state ADD COLUMN bitrix_sync_cursor TEXT');
+    }
   }
 
   private ensureScopedSyncState(connectionId: string): void {

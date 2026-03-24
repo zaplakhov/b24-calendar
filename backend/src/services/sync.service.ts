@@ -1,6 +1,6 @@
 /*
 Module: sync.service
-Role: Orchestrates scoped Bitrix-to-Yandex syncing, Yandex polling, status updates, and mapping-based idempotency.
+Role: Runs scoped incremental sync for Bitrix24 and Yandex with polling, manual sync-now, and optional webhook acceleration.
 Source of Truth: backend/src/services/sync.service.ts
 
 Uses:
@@ -84,11 +84,19 @@ interface WebhookDescriptor {
   eventId: string | null;
 }
 
-type SyncExecutionPath = 'bitrix_webhook' | 'manual_resync' | 'yandex_poll';
+type SyncExecutionPath = 'bitrix_webhook' | 'manual_sync' | 'scheduled_poll' | 'startup_initial' | 'settings_enabled';
+
+interface SyncExecutionStats {
+  processedBitrixEvents: number;
+  processedYandexEvents: number;
+  skippedRecurringEvents: number;
+  outcomeReason: string;
+}
 
 export class SyncService {
   private pollingTimer: NodeJS.Timeout | null = null;
-  private pollingInFlight = false;
+  private schedulerInFlight = false;
+  private readonly connectionInFlight = new Set<string>();
 
   public constructor(
     private readonly sqliteService: SQLiteService,
@@ -96,37 +104,19 @@ export class SyncService {
     private readonly yandexService: YandexCalDavService,
   ) {}
 
-  public startPollingLoop(schedule: PollingSchedule = { minDelayMs: 10 * 60 * 1000, maxDelayMs: 15 * 60 * 1000 }): void {
+  public startPollingLoop(schedule: PollingSchedule = { minDelayMs: 5 * 60 * 1000, maxDelayMs: 5 * 60 * 1000 }): void {
     if (this.pollingTimer) {
       return;
     }
 
-    const run = async (): Promise<void> => {
-      this.pollingTimer = null;
+    this.log('Starting polling loop.', {
+      maxDelayMs: schedule.maxDelayMs,
+      minDelayMs: schedule.minDelayMs,
+    });
 
-      if (this.pollingInFlight) {
-        this.scheduleNextPoll(schedule);
-        return;
-      }
-
-      this.pollingInFlight = true;
-
-      try {
-        const activeConnections = this.sqliteService.listActiveConnections();
-        for (const item of activeConnections) {
-          try {
-            await this.runYandexPolling(item.connection.id);
-          } catch {
-            // The error is already persisted per connection.
-          }
-        }
-      } finally {
-        this.pollingInFlight = false;
-        this.scheduleNextPoll(schedule);
-      }
-    };
-
-    this.scheduleNextPoll(schedule, run);
+    void this.runSchedulerIteration('startup_initial').finally(() => {
+      this.scheduleNextPoll(schedule);
+    });
   }
 
   public getStatus(connectionId: string): SyncStatusResponse {
@@ -135,7 +125,7 @@ export class SyncService {
       throw new Error(`Connection ${connectionId} was not found.`);
     }
 
-    const installationReady = Boolean(context.installation.accessToken && context.installation.status === 'active');
+    const installationReady = this.isInstallationReady(context.connection.id);
     const state = this.sqliteService.getSyncState(connectionId);
     const mappings = this.sqliteService.listEventMappings(connectionId);
     const mappingsCount = mappings.filter((item) => item.status !== 'deleted').length;
@@ -171,73 +161,14 @@ export class SyncService {
   }
 
   public async runManualResync(connectionId: string): Promise<ManualSyncResult> {
-    const context = this.requireContext(connectionId);
-    const preflight = this.getExecutionPreflight('manual_resync', context.connection, context.installationReady);
-    if (!preflight.allowed) {
-      const status = this.applyNoopPreflight(connectionId, 'manual_resync', preflight);
-      return {
-        ok: true,
-        message: preflight.message,
-        noop: true,
-        preflight,
-        processedBitrixEvents: 0,
-        processedYandexEvents: 0,
-        skippedRecurringEvents: 0,
-        status,
-      };
-    }
-
-    const startedAt = new Date().toISOString();
-    this.sqliteService.updateSyncState(connectionId, {
-      activeDirection: 'full',
-      lastErrorMessage: null,
-      lastRunAt: startedAt,
-      status: 'running',
-    });
-
-    try {
-      const bitrixEvents = await this.bitrixService.listEventsSince(connectionId, null);
-      let skippedRecurringEvents = 0;
-
-      for (const event of bitrixEvents) {
-        const skipped = await this.syncBitrixEvent(connectionId, event);
-        skippedRecurringEvents += skipped ? 1 : 0;
-      }
-
-      const yandexResult = await this.runYandexPollingInternal(connectionId);
-
-      this.sqliteService.updateSyncState(connectionId, {
-        activeDirection: null,
-        lastOutcomeReason: 'manual_resync_completed',
-        lastProcessedBitrixEvents: bitrixEvents.length,
-        lastProcessedYandexEvents: yandexResult.processedEvents,
-        lastSkippedRecurringEvents: skippedRecurringEvents + yandexResult.skippedRecurringEvents,
-        pollingFailureCount: 0,
-        lastSuccessAt: new Date().toISOString(),
-        status: 'success',
-      });
-
-      return {
-        ok: true,
-        message: 'Manual resync completed.',
-        noop: false,
-        preflight,
-        processedBitrixEvents: bitrixEvents.length,
-        processedYandexEvents: yandexResult.processedEvents,
-        skippedRecurringEvents: skippedRecurringEvents + yandexResult.skippedRecurringEvents,
-        status: this.getStatus(connectionId),
-      };
-    } catch (error: unknown) {
-      this.captureSyncError(connectionId, error);
-      throw error;
-    }
+    return this.runManualSyncNow(connectionId);
   }
 
-  public async runYandexPolling(connectionId: string): Promise<ManualSyncResult> {
+  public async runManualSyncNow(connectionId: string): Promise<ManualSyncResult> {
     const context = this.requireContext(connectionId);
-    const preflight = this.getExecutionPreflight('yandex_poll', context.connection, context.installationReady);
+    const preflight = this.getExecutionPreflight('manual_sync', context.connection, context.installationReady);
     if (!preflight.allowed) {
-      const status = this.applyNoopPreflight(connectionId, 'yandex_poll', preflight);
+      const status = this.applyNoopPreflight(connectionId, 'manual_sync', preflight);
       return {
         ok: true,
         message: preflight.message,
@@ -250,43 +181,27 @@ export class SyncService {
       };
     }
 
-    const startedAt = new Date().toISOString();
-    this.sqliteService.updateSyncState(connectionId, {
-      activeDirection: 'yandex_poll',
-      lastErrorMessage: null,
-      lastPollAt: startedAt,
-      lastRunAt: startedAt,
-      status: 'running',
-    });
+    const stats = await this.runSyncCycle(connectionId, 'manual_sync');
+    return {
+      ok: true,
+      message: 'Manual sync completed.',
+      noop: false,
+      preflight,
+      processedBitrixEvents: stats.processedBitrixEvents,
+      processedYandexEvents: stats.processedYandexEvents,
+      skippedRecurringEvents: stats.skippedRecurringEvents,
+      status: this.getStatus(connectionId),
+    };
+  }
 
-    try {
-      const result = await this.runYandexPollingInternal(connectionId);
-
-      this.sqliteService.updateSyncState(connectionId, {
-        activeDirection: null,
-        lastOutcomeReason: 'yandex_poll_completed',
-        lastProcessedBitrixEvents: 0,
-        lastProcessedYandexEvents: result.processedEvents,
-        lastSkippedRecurringEvents: result.skippedRecurringEvents,
-        pollingFailureCount: 0,
-        lastSuccessAt: new Date().toISOString(),
-        status: 'success',
+  public requestImmediateSync(connectionId: string, trigger: 'settings_enabled' | 'startup_initial' = 'settings_enabled'): void {
+    void this.runSyncCycle(connectionId, trigger).catch((error: unknown) => {
+      this.log('Immediate sync request failed.', {
+        connectionId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        trigger,
       });
-
-      return {
-        ok: true,
-        message: 'Yandex polling completed.',
-        noop: false,
-        preflight,
-        processedBitrixEvents: 0,
-        processedYandexEvents: result.processedEvents,
-        skippedRecurringEvents: result.skippedRecurringEvents,
-        status: this.getStatus(connectionId),
-      };
-    } catch (error: unknown) {
-      this.captureSyncError(connectionId, error);
-      throw error;
-    }
+    });
   }
 
   public async handleBitrixWebhook(connectionId: string, payload: Record<string, unknown>): Promise<SyncStatusResponse> {
@@ -299,57 +214,200 @@ export class SyncService {
 
     this.sqliteService.updateSyncState(connectionId, {
       lastWebhookAt: new Date().toISOString(),
-      lastErrorMessage: null,
-      status: 'running',
-      activeDirection: 'bitrix_webhook',
     });
 
+    if (!descriptor.eventId) {
+      this.sqliteService.updateSyncState(connectionId, {
+        lastOutcomeReason: 'bitrix_webhook_without_event_id',
+      });
+      return this.getStatus(connectionId);
+    }
+
+    await this.runSyncCycle(connectionId, 'bitrix_webhook', payload);
+    return this.getStatus(connectionId);
+  }
+
+  private async runSchedulerIteration(trigger: 'startup_initial' | 'scheduled_poll'): Promise<void> {
+    if (this.schedulerInFlight) {
+      this.log('Scheduler iteration skipped because a previous iteration is still running.');
+      return;
+    }
+
+    this.schedulerInFlight = true;
+
     try {
-      if (!descriptor.eventId) {
-        this.sqliteService.updateSyncState(connectionId, {
-          activeDirection: null,
-          lastOutcomeReason: 'bitrix_webhook_without_event_id',
-          lastProcessedBitrixEvents: 0,
-          lastProcessedYandexEvents: 0,
-          lastSkippedRecurringEvents: 0,
-          status: 'success',
-        });
+      const activeConnections = this.sqliteService.listActiveConnections();
+      this.log('Scheduler iteration started.', {
+        activeConnections: activeConnections.length,
+        trigger,
+      });
 
-        return this.getStatus(connectionId);
-      }
-
-      if (descriptor.action === 'delete') {
-        await this.handleBitrixDeletion(connectionId, descriptor.eventId);
-      } else {
-        const event = await this.bitrixService.fetchEventById(connectionId, descriptor.eventId);
-        if (event) {
-          await this.syncBitrixEvent(connectionId, event);
+      for (const item of activeConnections) {
+        try {
+          await this.runSyncCycle(item.connection.id, trigger);
+        } catch (error: unknown) {
+          this.log('Scheduled sync failed for connection.', {
+            connectionId: item.connection.id,
+            error: error instanceof Error ? error.message : 'Unknown error',
+            trigger,
+          });
         }
       }
 
-      this.sqliteService.updateSyncState(connectionId, {
-        activeDirection: null,
-        lastOutcomeReason: descriptor.action === 'delete' ? 'bitrix_webhook_delete_processed' : 'bitrix_webhook_upsert_processed',
-        lastProcessedBitrixEvents: 1,
-        lastProcessedYandexEvents: 0,
-        lastSuccessAt: new Date().toISOString(),
-        status: 'success',
+      this.log('Scheduler iteration finished.', {
+        activeConnections: activeConnections.length,
+        trigger,
       });
-
-      return this.getStatus(connectionId);
-    } catch (error: unknown) {
-      this.captureSyncError(connectionId, error);
-      throw error;
+    } finally {
+      this.schedulerInFlight = false;
     }
   }
 
-  private async runYandexPollingInternal(connectionId: string): Promise<{ processedEvents: number; skippedRecurringEvents: number }> {
+  private async runSyncCycle(connectionId: string, trigger: SyncExecutionPath, webhookPayload?: Record<string, unknown>): Promise<SyncExecutionStats> {
+    if (this.connectionInFlight.has(connectionId)) {
+      this.log('Skipping sync because connection is already in flight.', {
+        connectionId,
+        trigger,
+      });
+      return {
+        processedBitrixEvents: 0,
+        processedYandexEvents: 0,
+        skippedRecurringEvents: 0,
+        outcomeReason: `${trigger}_already_running`,
+      };
+    }
+
+    const context = this.requireContext(connectionId);
+    const preflight = this.getExecutionPreflight(trigger, context.connection, context.installationReady);
+    if (!preflight.allowed) {
+      this.applyNoopPreflight(connectionId, trigger, preflight);
+      return {
+        processedBitrixEvents: 0,
+        processedYandexEvents: 0,
+        skippedRecurringEvents: 0,
+        outcomeReason: `${trigger}_${preflight.reason}_noop`,
+      };
+    }
+
+    const previousState = this.sqliteService.getSyncState(connectionId);
+    const startedAt = new Date().toISOString();
+    this.connectionInFlight.add(connectionId);
+    this.sqliteService.updateSyncState(connectionId, {
+      activeDirection: trigger,
+      lastErrorAt: null,
+      lastErrorMessage: null,
+      lastRunAt: startedAt,
+      lastPollAt: trigger === 'bitrix_webhook' ? previousState.lastPollAt : startedAt,
+      status: 'running',
+    });
+
+    this.log('Connection sync started.', {
+      bitrixCursor: previousState.bitrixSyncCursor,
+      connectionId,
+      trigger,
+      yandexCursor: previousState.yandexSyncCursor,
+    });
+
+    try {
+      const stats = webhookPayload
+        ? await this.runWebhookAcceleratedSync(connectionId, webhookPayload, previousState)
+        : await this.runIncrementalSync(connectionId, previousState, startedAt);
+
+      this.sqliteService.updateSyncState(connectionId, {
+        activeDirection: null,
+        bitrixSyncCursor: startedAt,
+        lastOutcomeReason: stats.outcomeReason,
+        lastProcessedBitrixEvents: stats.processedBitrixEvents,
+        lastProcessedYandexEvents: stats.processedYandexEvents,
+        lastSkippedRecurringEvents: stats.skippedRecurringEvents,
+        lastSuccessAt: new Date().toISOString(),
+        pollingFailureCount: 0,
+        status: 'success',
+        yandexSyncCursor: startedAt,
+      });
+
+      this.log('Connection sync completed.', {
+        connectionId,
+        processedBitrixEvents: stats.processedBitrixEvents,
+        processedYandexEvents: stats.processedYandexEvents,
+        skippedRecurringEvents: stats.skippedRecurringEvents,
+        trigger,
+      });
+
+      return stats;
+    } catch (error: unknown) {
+      this.captureSyncError(connectionId, error);
+      this.log('Connection sync failed.', {
+        connectionId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        trigger,
+      });
+      throw error;
+    } finally {
+      this.connectionInFlight.delete(connectionId);
+    }
+  }
+
+  private async runIncrementalSync(connectionId: string, previousState: SyncState, startedAt: string): Promise<SyncExecutionStats> {
+    const bitrixEvents = await this.bitrixService.listEventsSince(connectionId, previousState.bitrixSyncCursor);
+    let skippedRecurringEvents = 0;
+
+    for (const event of bitrixEvents) {
+      const skipped = await this.syncBitrixEvent(connectionId, event);
+      skippedRecurringEvents += skipped ? 1 : 0;
+    }
+
+    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, startedAt);
+
+    return {
+      processedBitrixEvents: bitrixEvents.length,
+      processedYandexEvents: yandexResult.processedEvents,
+      skippedRecurringEvents: skippedRecurringEvents + yandexResult.skippedRecurringEvents,
+      outcomeReason: 'incremental_sync_completed',
+    };
+  }
+
+  private async runWebhookAcceleratedSync(connectionId: string, payload: Record<string, unknown>, previousState: SyncState): Promise<SyncExecutionStats> {
+    const descriptor = this.describeWebhookPayload(payload);
+    let skippedRecurringEvents = 0;
+    let processedBitrixEvents = 0;
+
+    if (descriptor.eventId) {
+      if (descriptor.action === 'delete') {
+        await this.handleBitrixDeletion(connectionId, descriptor.eventId);
+        processedBitrixEvents = 1;
+      } else {
+        const event = await this.bitrixService.fetchEventById(connectionId, descriptor.eventId);
+        if (event) {
+          processedBitrixEvents = 1;
+          const skipped = await this.syncBitrixEvent(connectionId, event);
+          skippedRecurringEvents += skipped ? 1 : 0;
+        }
+      }
+    }
+
+    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, new Date().toISOString());
+
+    return {
+      processedBitrixEvents,
+      processedYandexEvents: yandexResult.processedEvents,
+      skippedRecurringEvents: skippedRecurringEvents + yandexResult.skippedRecurringEvents,
+      outcomeReason: descriptor.action === 'delete' ? 'bitrix_webhook_delete_processed' : 'bitrix_webhook_upsert_processed',
+    };
+  }
+
+  private async runYandexIncrementalInternal(connectionId: string, previousState: SyncState, startedAt: string): Promise<{ processedEvents: number; skippedRecurringEvents: number }> {
     const events = await this.yandexService.listEvents(connectionId);
     const currentUrls = new Set(events.map((event) => event.url));
-    const cursor = await this.yandexService.getSelectedCalendarCursor(connectionId);
+    let processedEvents = 0;
     let skippedRecurringEvents = 0;
 
     for (const event of events) {
+      if (!this.shouldProcessYandexEvent(connectionId, event, previousState.yandexSyncCursor)) {
+        continue;
+      }
+
+      processedEvents += 1;
       const skipped = await this.syncYandexEvent(connectionId, event);
       skippedRecurringEvents += skipped ? 1 : 0;
     }
@@ -366,24 +424,39 @@ export class SyncService {
 
       this.sqliteService.upsertEventMapping({
         ...mapping,
-        deletedAt: new Date().toISOString(),
+        deletedAt: startedAt,
         deletedBy: 'yandex',
         lastDecisionReason: 'yandex_missing_during_poll',
-        lastSyncedAt: new Date().toISOString(),
+        lastSyncedAt: startedAt,
         lastWinner: 'yandex',
         status: 'deleted',
       });
     }
 
-    this.sqliteService.updateSyncState(connectionId, {
-      lastPollAt: new Date().toISOString(),
-      yandexSyncCursor: cursor,
-    });
-
     return {
-      processedEvents: events.length,
+      processedEvents,
       skippedRecurringEvents,
     };
+  }
+
+  private shouldProcessYandexEvent(connectionId: string, event: YandexCalendarEvent, cursor: string | null): boolean {
+    const mapping = this.sqliteService.getEventMappingByYandexUrl(connectionId, event.url);
+    if (!mapping) {
+      return true;
+    }
+
+    const fingerprint = buildYandexEventFingerprint(event);
+    if (mapping.targetFingerprint !== fingerprint || mapping.status === 'deleted') {
+      return true;
+    }
+
+    if (!cursor || !event.updatedAt) {
+      return false;
+    }
+
+    const updatedAtMs = Date.parse(event.updatedAt);
+    const cursorMs = Date.parse(cursor);
+    return !Number.isNaN(updatedAtMs) && !Number.isNaN(cursorMs) && updatedAtMs > cursorMs;
   }
 
   private async syncBitrixEvent(connectionId: string, event: BitrixCalendarEvent): Promise<boolean> {
@@ -562,7 +635,7 @@ export class SyncService {
   }
 
   private getManualResyncPreflight(settings: ConnectionSettings, installationReady: boolean): ManualResyncPreflight {
-    return this.getExecutionPreflight('manual_resync', settings, installationReady);
+    return this.getExecutionPreflight('manual_sync', settings, installationReady);
   }
 
   private applyNoopPreflight(connectionId: string, path: SyncExecutionPath, preflight: ManualResyncPreflight): SyncStatusResponse {
@@ -574,10 +647,10 @@ export class SyncService {
       lastErrorAt: null,
       lastErrorMessage: null,
       lastOutcomeReason: `${path}_${preflight.reason}_noop`,
-      lastPollAt: path === 'yandex_poll' ? attemptedAt : currentState.lastPollAt,
+      lastPollAt: path === 'scheduled_poll' || path === 'startup_initial' || path === 'settings_enabled' ? attemptedAt : currentState.lastPollAt,
       lastProcessedBitrixEvents: 0,
       lastProcessedYandexEvents: 0,
-      lastRunAt: path === 'manual_resync' || path === 'yandex_poll' ? attemptedAt : currentState.lastRunAt,
+      lastRunAt: attemptedAt,
       lastSkippedRecurringEvents: 0,
       lastWebhookAt: path === 'bitrix_webhook' ? attemptedAt : currentState.lastWebhookAt,
       status: preflight.reason === 'disabled' ? 'disabled' : 'idle',
@@ -590,11 +663,13 @@ export class SyncService {
     switch (path) {
       case 'bitrix_webhook':
         return 'Bitrix webhook processing is ready to run.';
-      case 'yandex_poll':
-        return 'Yandex polling is ready to run.';
-      case 'manual_resync':
+      case 'scheduled_poll':
+      case 'startup_initial':
+      case 'settings_enabled':
+        return 'Scheduled sync is ready to run.';
+      case 'manual_sync':
       default:
-        return 'Manual resync is ready to run.';
+        return 'Manual sync is ready to run.';
     }
   }
 
@@ -605,15 +680,15 @@ export class SyncService {
         : 'Bitrix webhook was ignored because Bitrix authorization and Yandex credentials are not fully configured.';
     }
 
-    if (path === 'yandex_poll') {
+    if (path === 'manual_sync') {
       return reason === 'disabled'
-        ? 'Yandex polling skipped because sync is disabled.'
-        : 'Yandex polling skipped because Bitrix authorization and Yandex credentials are not fully configured.';
+        ? 'Manual sync is unavailable while sync is disabled.'
+        : 'Manual sync is unavailable until Bitrix authorization and Yandex credentials are configured.';
     }
 
     return reason === 'disabled'
-      ? 'Manual resync is unavailable while sync is disabled.'
-      : 'Manual resync is unavailable until Bitrix authorization and Yandex credentials are configured.';
+      ? 'Scheduled sync skipped because sync is disabled.'
+      : 'Scheduled sync skipped because Bitrix authorization and Yandex credentials are not fully configured.';
   }
 
   private captureSyncError(connectionId: string, error: unknown): void {
@@ -639,23 +714,22 @@ export class SyncService {
     });
   }
 
-  private scheduleNextPoll(schedule: PollingSchedule, callback?: () => Promise<void>): void {
-    const nextRun = callback ?? (() => Promise.resolve());
+  private scheduleNextPoll(schedule: PollingSchedule): void {
     const delay = this.computeNextDelay(schedule);
+    this.log('Next polling iteration scheduled.', { delayMs: delay });
     this.pollingTimer = setTimeout(() => {
-      void nextRun();
+      void this.runSchedulerIteration('scheduled_poll').finally(() => {
+        this.scheduleNextPoll(schedule);
+      });
     }, delay);
   }
 
   private computeNextDelay(schedule: PollingSchedule): number {
     const states = this.sqliteService.listActiveConnections().map((item) => this.sqliteService.getSyncState(item.connection.id));
     const maxFailureCount = states.reduce((max, state) => Math.max(max, state.pollingFailureCount), 0);
-    const minDelay = Math.max(1, schedule.minDelayMs);
-    const maxDelay = Math.max(minDelay, schedule.maxDelayMs);
-    const jitterDelay = Math.round(minDelay + Math.random() * (maxDelay - minDelay));
+    const fixedDelay = Math.max(1, Math.min(schedule.minDelayMs, schedule.maxDelayMs));
     const cappedBackoffMultiplier = Math.min(4, Math.max(1, 2 ** maxFailureCount));
-
-    return jitterDelay * cappedBackoffMultiplier;
+    return fixedDelay * cappedBackoffMultiplier;
   }
 
   private requireContext(connectionId: string): { connection: ConnectionSettings; installationReady: boolean } {
@@ -666,7 +740,21 @@ export class SyncService {
 
     return {
       connection: context.connection,
-      installationReady: Boolean(context.installation.accessToken && context.installation.status === 'active'),
+      installationReady: this.isInstallationReady(connectionId),
     };
+  }
+
+  private isInstallationReady(connectionId: string): boolean {
+    const context = this.sqliteService.getConnectionContext(connectionId);
+    return Boolean(context?.installation.accessToken && context.installation.status === 'active');
+  }
+
+  private log(message: string, meta?: Record<string, unknown>): void {
+    if (meta) {
+      console.info(`[sync-service] ${message}`, meta);
+      return;
+    }
+
+    console.info(`[sync-service] ${message}`);
   }
 }
