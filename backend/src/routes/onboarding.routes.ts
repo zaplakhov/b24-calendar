@@ -119,8 +119,16 @@ export function createOnboardingRouter(dependencies: OnboardingRouterDependencie
 
   router.put('/:token', (request: Request, response: Response) => {
     const context = resolveContext(sqliteService, request.params.token);
+    const previousSettings = context.connection;
     const nextSettings = sqliteService.updateConnectionSettings(context.connection.id, normalizeSettingsPatch(request.body));
-    if (isReadyForImmediateSync(nextSettings) && !context.connection.syncEnabled) {
+    const calendarBindingChanged = previousSettings.bitrixCalendarId !== nextSettings.bitrixCalendarId
+      || previousSettings.yandexCalendarUrl !== nextSettings.yandexCalendarUrl;
+
+    if (calendarBindingChanged) {
+      sqliteService.resetConnectionSync(context.connection.id);
+    }
+
+    if (isReadyForImmediateSync(nextSettings) && (!context.connection.syncEnabled || calendarBindingChanged)) {
       syncService.requestImmediateSync(context.connection.id, 'settings_enabled');
     }
 

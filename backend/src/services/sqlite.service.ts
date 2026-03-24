@@ -704,6 +704,29 @@ export class SQLiteService {
     return nextRecord;
   }
 
+  public resetConnectionSync(connectionId: string): void {
+    this.ensureScopedSyncState(connectionId);
+    this.database.prepare<[string]>('DELETE FROM connection_event_mappings WHERE connection_id = ?').run(connectionId);
+    this.database.prepare(
+      `UPDATE connection_sync_state
+         SET status = 'idle',
+             last_run_at = NULL,
+             last_success_at = NULL,
+             last_error_at = NULL,
+             last_error_message = NULL,
+             last_poll_at = NULL,
+             active_direction = NULL,
+             bitrix_sync_cursor = NULL,
+             yandex_sync_cursor = NULL,
+             polling_failure_count = 0,
+             last_processed_bitrix_events = 0,
+             last_processed_yandex_events = 0,
+             last_skipped_recurring_events = 0,
+             last_outcome_reason = NULL
+       WHERE connection_id = ?`,
+    ).run(connectionId);
+  }
+
   public countConnections(): number {
     const row = this.database.prepare<[], { count: number }>('SELECT COUNT(*) AS count FROM user_connections').get();
     return row?.count ?? 0;
