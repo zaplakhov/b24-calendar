@@ -84,7 +84,8 @@ export class YandexCalDavService {
     });
 
     if (!response.ok) {
-      throw new Error(`Yandex CalDAV create failed with status ${response.status}.`);
+      const rawResponse = await response.text().catch(() => '');
+      throw new Error(`Yandex CalDAV create failed with status ${response.status}. Raw response: ${rawResponse || 'empty body'}`);
     }
 
     const location = response.headers.get('location');
@@ -110,7 +111,8 @@ export class YandexCalDavService {
     });
 
     if (!response.ok) {
-      throw new Error(`Yandex CalDAV update failed with status ${response.status}.`);
+      const rawResponse = await response.text().catch(() => '');
+      throw new Error(`Yandex CalDAV update failed with status ${response.status}. Raw response: ${rawResponse || 'empty body'}`);
     }
 
     return parseYandexCalendarObject(buildIcsEvent(draft), existing.url, response.headers.get('etag') ?? existing.etag ?? null);
@@ -129,7 +131,8 @@ export class YandexCalDavService {
     });
 
     if (!response.ok) {
-      throw new Error(`Yandex CalDAV delete failed with status ${response.status}.`);
+      const rawResponse = await response.text().catch(() => '');
+      throw new Error(`Yandex CalDAV delete failed with status ${response.status}. Raw response: ${rawResponse || 'empty body'}`);
     }
   }
 
