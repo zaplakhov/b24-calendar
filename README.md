@@ -1,77 +1,145 @@
-# b24-calendar MVP
+# b24-calendar
 
-Минимальный MVP-каркас для синхронизации событий календаря Bitrix24 с Яндекс Календарём с настройками на SQLite, приёмом вебхуков, ручной ресинхронизацией и встроенной страницей настроек.
+Сервис синхронизации календарей `Bitrix24 <-> Яндекс Календарь` в режиме `Bitrix local app without UI`.
 
-## Что включено
+Приложение работает как серверная интеграция:
+- локальное приложение устанавливается в Bitrix24 без встроенного интерфейса
+- пользователь проходит внешний OAuth/onboarding flow на вашем домене
+- настройки Яндекс Календаря заполняются на внешней странице
+- синхронизация и polling выполняются на сервере
 
-- Bootstrap SQLite для настроек одиночного пользователя, кеша календарей провайдера, состояния синхронизации и маппинга событий
-- API настроек с эндпоинтами для обнаружения календарей
-- Скелет REST-сервиса Bitrix для CRUD календарей/событий
-- Обёртка CalDAV-сервиса Яндекс для CRUD календарей/событий
-- Оркестрация синхронизации с приёмом вебхуков, поллингом Яндекс, пропуском повторяющихся событий и идемпотентностью на основе маппинга
-- Встроенный фронтенд по адресу `/embedded/settings`
-- Dockerfile и пример переменных окружения
+## Что уже реализовано
 
-## Локальный запуск
+- Bitrix24 install endpoint для локального приложения
+- внешний `connect` flow для OAuth авторизации пользователя Bitrix24
+- внешний onboarding page для настройки Яндекс Календаря
+- per-user connections в SQLite
+- scoped sync state и event mappings по connection
+- загрузка календарей Bitrix24 и Яндекс для каждой connection
+- ручная ресинхронизация и background polling
+- Dockerfile для деплоя на VPS / Coolify
 
-1. Скопируйте `.env.example` в ваше окружение выполнения.
-2. Установите зависимости бэкенда:
+## Архитектура
 
-   `npm install --prefix backend`
+- `backend/` — Express + SQLite + Bitrix REST + Yandex CalDAV
+- `frontend/connect/` — внешняя страница запуска OAuth
+- `frontend/onboarding/` — внешняя страница настройки календарей и sync
+- `.data/` или `/data` — SQLite volume
 
-3. Соберите бэкенд:
+## Переменные окружения
 
-   `npm run build --prefix backend`
+Скопируйте `.env.example` и заполните минимум:
 
-4. Запустите бэкенд:
+- `APP_BASE_URL` — публичный HTTPS URL приложения
+- `APP_SIGNING_SECRET` — секрет для подписи state / onboarding flow
+- `BITRIX_CLIENT_ID` — ключ приложения из формы локального приложения Bitrix24
+- `BITRIX_CLIENT_SECRET` — секрет приложения из формы локального приложения Bitrix24
 
-    `npm start --prefix backend`
+Пример локального запуска:
 
-Путь без lock-файлов выбран намеренно для этого MVP: локальные сборки используют `npm install --prefix backend`, а Docker использует тот же шаг установки внутри образа.
+```bash
+npm install --prefix backend
+npm run build --prefix backend
+npm start --prefix backend
+```
 
-## Запуск в Docker
+## Docker / Coolify
 
-Собрать из корня репозитория:
+Собрать образ:
 
-`docker build -t b24-calendar-sync .`
+```bash
+docker build -t b24-calendar .
+```
 
-Запустить с примонтированным томом, чтобы SQLite переживал перезапуски:
+Запустить с volume для SQLite:
 
-`docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar-sync b24-calendar-sync`
+```bash
+docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calendar
+```
 
-Поведение контейнера по умолчанию безопасно для ревьюеров: `SYNC_ENABLED=false` и `SQLITE_DB_PATH=/data/b24-calendar.sqlite`, пока реальные реквизиты Bitrix24 и Яндекс не будут сохранены через `/api/settings` или встроенный UI.
+В production рекомендуется:
+- подключить persistent volume в `/data`
+- выставить `APP_BASE_URL` на публичный HTTPS домен
+- хранить `BITRIX_CLIENT_SECRET` и `APP_SIGNING_SECRET` в секретах Coolify
 
-## Основные эндпоинты
+## Настройка в Bitrix24
 
-- `GET /health`
-- `GET /api/settings`
-- `PUT /api/settings`
-- `GET /api/settings/yandex/calendars`
-- `GET /api/sync/status`
-- `POST /api/sync/run`
-- `POST /api/webhook/bitrix`
-- `GET /embedded/settings`
+1. Разверните сервис по HTTPS.
+2. Откройте Bitrix24: `Приложения -> Разработчикам -> Другое -> Локальное приложение`.
+3. Включите опцию `Приложение использует только API`.
+4. Укажите:
+   - `Путь вашего обработчика` -> `https://your-domain.example.com/bitrix/oauth/callback`
+   - `Путь для первоначальной установки` -> `https://your-domain.example.com/bitrix/install`
+5. Сохраните приложение.
+6. Bitrix24 покажет `client_id` и `client_secret`.
+7. Запишите их в `BITRIX_CLIENT_ID` и `BITRIX_CLIENT_SECRET` и перезапустите сервис.
+8. После этого откройте внешнюю страницу:
 
-Доказательства для ревьюеров доступны напрямую в API-ответах:
+   `https://your-domain.example.com/connect/`
 
-- `GET /api/settings` включает текущие настройки, кеш календарей Яндекс и доказательства для ревьюеров: `lastSync`, `lastError` и обнаруженные календари.
-- `GET /api/sync/status` включает доказательства для ревьюеров: количества обработанных элементов, пропущенные повторяющиеся события, подсказка статуса (`ready` / `disabled` / `not_configured`) и последняя причина результата.
-- `POST /api/sync/run` возвращает результат ручной ресинхронизации плюс тот же блок доказательств для ревьюеров.
+9. Введите портал Bitrix24 и пройдите OAuth.
+10. После callback вы попадете на onboarding URL вида:
 
-## Чеклист ручной проверки
+    `https://your-domain.example.com/onboarding/<token>`
 
-1. Сохраните реквизиты Bitrix24 и Яндекс через `PUT /api/settings` или `/embedded/settings` и подтвердите, что `GET /api/settings` показывает `reviewerEvidence.syncStatus` и сохранённые значения после перезапуска.
-2. Загрузите календари Яндекс через `GET /api/settings/yandex/calendars` и подтвердите `reviewerEvidence.calendarsDiscovered > 0`.
-3. Выполните create/update/delete в Bitrix24 и подтвердите, что парный объект Яндекс создаётся/обновляется/удаляется без дублирования при повторной доставке вебхука.
-4. Выполните create/update/delete в Яндекс, запустите `POST /api/sync/run` и подтвердите, что Bitrix24 отражает тот же результат после поллинга.
-5. Создайте повторяющееся событие на любой стороне и подтвердите, что синхронизация остаётся работоспособной, а доказательства в ответе сообщают о пропущенном повторяющемся событии (проверьте `reviewerEvidence.lastRun.skippedRecurringEvents` и `lastError` для сообщения о пропуске).
-6. Повторно отправьте тот же payload вебхука и подтвердите, что дубликаты событий не создаются благодаря идемпотентности на основе отпечатков.
-7. Запустите ручную ресинхронизацию и подтвердите, что `processedBitrixEvents`, `processedYandexEvents`, `skippedRecurringEvents`, `lastSyncAt` и `lastError` видны в HTTP-ответах.
-8. Перезапустите контейнер Docker с тем же монтированием `/data` и подтвердите, что настройки, маппинги и статус синхронизации остаются доступными.
+11. На onboarding странице:
+    - загрузите календари Bitrix24
+    - укажите `Yandex username`
+    - укажите `app password`
+    - загрузите календари Яндекс
+    - выберите пару календарей
+    - включите sync
 
-## Ограничения MVP
+## Основные маршруты
 
-- Нормализация REST-пейлоадов Bitrix прагматична и может потребовать доработок для конкретного портала.
-- Повторяющиеся события намеренно пропускаются.
-- Поллинг использует джиттер 10-15 минут с сохранённым курсором и отложенной попыткой после сбоев.
-- Секреты сохраняются в SQLite для MVP с одним пользователем и должны быть перенесены в более надёжное хранилище секретов в production.
+### Public web
+
+- `GET /` -> redirect на `/connect/`
+- `GET /connect/` -> внешняя страница старта OAuth
+- `GET /onboarding/:token` -> внешняя страница настройки connection
+
+### Bitrix lifecycle
+
+- `ALL /bitrix/install` -> обработчик первоначальной установки локального приложения
+- `GET /bitrix/oauth/start?portal=company.bitrix24.ru` -> старт OAuth пользователя
+- `GET /bitrix/oauth/callback` -> callback после Bitrix OAuth
+
+### API onboarding
+
+- `GET /api/onboarding/:token` -> полное состояние connection
+- `PUT /api/onboarding/:token` -> сохранить настройки connection
+- `GET /api/onboarding/:token/bitrix/calendars` -> загрузить календари Bitrix24
+- `GET /api/onboarding/:token/yandex/calendars` -> загрузить календари Яндекс
+- `GET /api/onboarding/:token/sync/status` -> статус sync
+- `POST /api/onboarding/:token/sync/run` -> ручная ресинхронизация
+
+### Runtime
+
+- `POST /api/webhook/bitrix` -> webhook intake для Bitrix событий
+- `GET /health` -> технический health endpoint
+
+## Как это работает для пользователя
+
+1. Администратор портала регистрирует local app в Bitrix24.
+2. Пользователь открывает `/connect/`.
+3. Пользователь проходит Bitrix OAuth.
+4. Сервис создает scoped connection для конкретного Bitrix пользователя.
+5. Пользователь заполняет данные Яндекс на `/onboarding/:token`.
+6. Сервис синхронизирует события только для этой connection.
+
+## Ограничения текущей версии
+
+- Текущий deployment предполагает один набор `BITRIX_CLIENT_ID/BITRIX_CLIENT_SECRET` на один инстанс сервиса.
+- Это хорошо подходит для одного портала Bitrix24 с любым количеством пользователей этого портала.
+- Для true multi-portal SaaS нужны отдельные client credentials per portal и отдельный lifecycle management.
+- Повторяющиеся события по-прежнему намеренно пропускаются.
+
+## Быстрая ручная проверка
+
+1. Убедитесь, что `GET /health` отвечает `status: ok`.
+2. Отправьте install payload из Bitrix24 и проверьте, что `/bitrix/install` отвечает `ok: true`.
+3. Откройте `/connect/` и выполните OAuth для пользователя портала.
+4. На `/onboarding/:token` загрузите календари Bitrix24 и Яндекс.
+5. Сохраните настройки и включите sync.
+6. Запустите `POST /api/onboarding/:token/sync/run` или кнопку ручной ресинхронизации.
+7. Проверьте, что статусы и reviewer evidence обновляются.

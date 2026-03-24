@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Onboarding синхронизации</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="card header-card">
+        <div>
+          <p class="eyebrow">External onboarding</p>
+          <h1>Bitrix24 → Yandex Calendar</h1>
+          <p id="portalCaption" class="lead">Загружаем данные подключения...</p>
+        </div>
+        <button id="refreshSettingsButton" class="button button--secondary" type="button">Обновить</button>
+      </section>
+
+      <p id="statusBanner" class="banner" role="status" aria-live="polite">Загрузка конфигурации...</p>
+
+      <section class="grid">
+        <section class="card form-card">
+          <h2>Bitrix24</h2>
+          <div class="info-grid">
+            <div>
+              <span class="meta-label">Портал</span>
+              <strong id="portalValue">-</strong>
+            </div>
+            <div>
+              <span class="meta-label">Пользователь</span>
+              <strong id="bitrixUserValue">-</strong>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="loadBitrixCalendarsButton" class="button button--secondary" type="button">Загрузить календари Bitrix24</button>
+          </div>
+          <label>
+            <span>Календарь Bitrix24</span>
+            <select id="bitrixCalendarId" name="bitrixCalendarId"></select>
+          </label>
+        </section>
+
+        <form id="settingsForm" class="card form-card">
+          <h2>Яндекс Календарь</h2>
+          <label>
+            <span>Yandex username</span>
+            <input id="yandexUsername" name="yandexUsername" type="email" inputmode="email" autocomplete="username" placeholder="login@yandex.ru" />
+          </label>
+          <label>
+            <span>App password</span>
+            <input id="yandexPassword" name="yandexPassword" type="password" autocomplete="new-password" />
+          </label>
+          <div class="actions">
+            <button id="loadYandexCalendarsButton" class="button button--secondary" type="button">Загрузить календари Яндекс</button>
+          </div>
+          <label>
+            <span>Календарь Яндекс</span>
+            <select id="yandexCalendarUrl" name="yandexCalendarUrl"></select>
+          </label>
+          <label class="checkbox-row">
+            <input id="syncEnabled" name="syncEnabled" type="checkbox" />
+            <span>Включить синхронизацию</span>
+          </label>
+          <div class="actions actions--stacked">
+            <button class="button" type="submit">Сохранить настройки</button>
+            <button id="manualSyncButton" class="button button--secondary" type="button">Запустить полную ресинхронизацию</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="grid grid--secondary">
+        <section class="card summary-card">
+          <h2>Статус</h2>
+          <dl class="summary-grid">
+            <div>
+              <dt>Подключение</dt>
+              <dd id="connectionStatus">Неизвестно</dd>
+            </div>
+            <div>
+              <dt>Последний sync</dt>
+              <dd id="lastSyncValue">Никогда</dd>
+            </div>
+            <div>
+              <dt>Последняя ошибка</dt>
+              <dd id="lastErrorValue">Нет</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="card status-card">
+          <h2>Runtime status</h2>
+          <pre id="runtimeStatus">Статус еще не загружен.</pre>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js" defer></script>
+  </body>
+</html>

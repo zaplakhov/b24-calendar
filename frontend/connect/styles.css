@@ -1,0 +1,128 @@
+:root {
+  color-scheme: light;
+  --bg: #f4f1ea;
+  --panel: rgba(255, 255, 255, 0.88);
+  --panel-border: rgba(65, 52, 40, 0.12);
+  --text: #23180f;
+  --muted: #6f6053;
+  --accent: #c6562d;
+  --accent-strong: #9f3f1d;
+  --shadow: 0 24px 60px rgba(62, 34, 15, 0.12);
+  --radius: 24px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(198, 86, 45, 0.18), transparent 28%),
+    linear-gradient(180deg, #f8f2e9 0%, var(--bg) 100%);
+}
+
+.page {
+  width: min(960px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 48px 0 72px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--shadow);
+  border-radius: var(--radius);
+  padding: 28px;
+  backdrop-filter: blur(10px);
+}
+
+.card + .card {
+  margin-top: 20px;
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  color: var(--accent-strong);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+h1,
+h2 {
+  margin: 0 0 16px;
+}
+
+.lead,
+ol,
+.banner,
+label span {
+  color: var(--muted);
+}
+
+.stacked-form {
+  display: grid;
+  gap: 16px;
+}
+
+label {
+  display: grid;
+  gap: 8px;
+}
+
+input,
+button {
+  font: inherit;
+}
+
+input {
+  border: 1px solid rgba(111, 96, 83, 0.25);
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.button {
+  border: 0;
+  border-radius: 999px;
+  padding: 14px 18px;
+  font-weight: 700;
+  color: white;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  cursor: pointer;
+}
+
+.banner {
+  margin: 18px 0 0;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: rgba(198, 86, 45, 0.08);
+}
+
+.banner.is-error {
+  color: #8c2a14;
+  background: rgba(173, 50, 17, 0.12);
+}
+
+ol {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 10px;
+}
+
+@media (max-width: 640px) {
+  .page {
+    width: min(100vw - 20px, 960px);
+    padding: 24px 0 40px;
+  }
+
+  .card {
+    padding: 20px;
+  }
+}

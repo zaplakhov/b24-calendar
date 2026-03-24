@@ -28,3 +28,8 @@ session-*.md
 
 # Local data storage
 .data/
+backend/data/
+
+# Node artifacts
+backend/node_modules/
+backend/dist/

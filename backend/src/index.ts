@@ -1,6 +1,6 @@
 /*
 Module: index
-Role: Creates and boots the Express runtime, wiring real services, webhook intake, and the embedded settings frontend.
+Role: Creates and boots the Express runtime for Bitrix local app install callbacks and external onboarding flow.
 Source of Truth: backend/src/index.ts
 
 Uses:
@@ -9,12 +9,13 @@ Uses:
   node:fs: true
   node:path: true
   ./services/sqlite.service.ts:SQLiteService: true
+  ./services/bitrix-auth.service.ts:BitrixAuthService: true
   ./services/bitrix.service.ts:BitrixService: true
   ./services/yandex-caldav.service.ts:YandexCalDavService: true
   ./services/sync.service.ts:SyncService: true
   ./handlers/webhook.handler.ts:createBitrixWebhookHandler: true
-  ./routes/settings.routes.ts:createSettingsRouter: true
-  ./routes/sync.routes.ts:createSyncRouter: true
+  ./routes/bitrix.routes.ts:createBitrixRouter: true
+  ./routes/onboarding.routes.ts:createOnboardingRouter: true
 
 Used by:
   backend/package.json:start: true
@@ -29,8 +30,9 @@ import { createServer, type Server } from 'node:http';
 import { resolve } from 'node:path';
 
 import { createBitrixWebhookHandler } from './handlers/webhook.handler';
-import { createSettingsRouter, EMBEDDED_SETTINGS_PAGE_PATH } from './routes/settings.routes';
-import { createSyncRouter } from './routes/sync.routes';
+import { createBitrixRouter } from './routes/bitrix.routes';
+import { createOnboardingRouter } from './routes/onboarding.routes';
+import { BitrixAuthService } from './services/bitrix-auth.service';
 import { BitrixService } from './services/bitrix.service';
 import { SQLiteService } from './services/sqlite.service';
 import { SyncService } from './services/sync.service';
@@ -42,36 +44,58 @@ const DEFAULT_POLL_MINUTES_MAX = 15;
 
 interface AppDependencies {
   sqliteService: SQLiteService;
+  bitrixAuthService: BitrixAuthService;
+  bitrixService: BitrixService;
   syncService: SyncService;
   yandexService: YandexCalDavService;
 }
 
 export function createApp(dependencies: AppDependencies): Express {
   const app = express();
-  const { sqliteService, syncService, yandexService } = dependencies;
-  const frontendDirectory = resolveFrontendDirectory();
+  const { sqliteService, bitrixAuthService, bitrixService, syncService, yandexService } = dependencies;
+  const onboardingDirectory = resolveFrontendDirectory('onboarding');
+  const connectDirectory = resolveFrontendDirectory('connect');
 
   app.use(express.json());
-  app.use('/api/settings', createSettingsRouter({
+  app.use(express.urlencoded({ extended: true }));
+
+  app.use('/bitrix', createBitrixRouter({
+    bitrixAuthService,
+    sqliteService,
+  }));
+  app.use('/api/onboarding', createOnboardingRouter({
+    bitrixService,
     sqliteService,
     syncService,
     yandexService,
   }));
-  app.use('/api/sync', createSyncRouter(syncService));
-  app.post('/api/webhook/bitrix', createBitrixWebhookHandler(syncService));
+  app.post('/api/webhook/bitrix', createBitrixWebhookHandler(sqliteService, syncService));
 
-  if (frontendDirectory) {
-    app.use(EMBEDDED_SETTINGS_PAGE_PATH, express.static(frontendDirectory));
-    app.get(EMBEDDED_SETTINGS_PAGE_PATH, (_request: Request, response: Response) => {
-      response.sendFile(resolve(frontendDirectory, 'index.html'));
+  if (onboardingDirectory) {
+    app.use('/onboarding', express.static(onboardingDirectory));
+    app.get('/onboarding/:token', (_request: Request, response: Response) => {
+      response.sendFile(resolve(onboardingDirectory, 'index.html'));
     });
   }
+
+  if (connectDirectory) {
+    app.use('/connect', express.static(connectDirectory));
+    app.get('/connect', (_request: Request, response: Response) => {
+      response.redirect('/connect/');
+    });
+  }
+
+  app.get('/', (_request: Request, response: Response) => {
+    response.redirect('/connect/');
+  });
 
   app.get('/health', (_request: Request, response: Response) => {
     response.status(200).json({
       service: 'b24-calendar-backend',
       status: 'ok',
-      sync: syncService.getStatus(),
+      installationsCount: sqliteService.listInstallations().length,
+      connectionsCount: sqliteService.countConnections(),
+      activeConnectionsCount: sqliteService.countActiveConnections(),
     });
   });
 
@@ -84,11 +108,11 @@ export function createApp(dependencies: AppDependencies): Express {
   return app;
 }
 
-function resolveFrontendDirectory(): string | null {
+function resolveFrontendDirectory(kind: 'connect' | 'onboarding'): string | null {
   const candidates = [
-    resolve(__dirname, '../../frontend/settings-page'),
-    resolve(process.cwd(), '../frontend/settings-page'),
-    resolve(process.cwd(), 'frontend/settings-page'),
+    resolve(__dirname, `../../frontend/${kind}`),
+    resolve(process.cwd(), `../frontend/${kind}`),
+    resolve(process.cwd(), `frontend/${kind}`),
   ];
 
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
@@ -96,25 +120,26 @@ function resolveFrontendDirectory(): string | null {
 
 export function resolvePort(rawPort: string | undefined): number {
   const parsedPort = Number.parseInt(rawPort ?? '', 10);
-
   return Number.isInteger(parsedPort) && parsedPort > 0 ? parsedPort : DEFAULT_PORT;
 }
 
 function resolvePollDelayMs(rawMinutes: string | undefined, fallbackMinutes: number): number {
   const parsedMinutes = Number.parseInt(rawMinutes ?? '', 10);
   const minutes = Number.isInteger(parsedMinutes) && parsedMinutes > 0 ? parsedMinutes : fallbackMinutes;
-
   return minutes * 60 * 1000;
 }
 
 function createDependencies(): AppDependencies {
   const sqliteService = new SQLiteService();
-  const bitrixService = new BitrixService(sqliteService);
+  const bitrixAuthService = new BitrixAuthService(sqliteService);
+  const bitrixService = new BitrixService(sqliteService, bitrixAuthService);
   const yandexService = new YandexCalDavService(sqliteService);
   const syncService = new SyncService(sqliteService, bitrixService, yandexService);
 
   return {
     sqliteService,
+    bitrixAuthService,
+    bitrixService,
     syncService,
     yandexService,
   };
@@ -130,7 +155,7 @@ export async function startServer(port = resolvePort(process.env.PORT)): Promise
     minDelayMs: resolvePollDelayMs(process.env.SYNC_POLL_MIN_MINUTES, DEFAULT_POLL_MINUTES_MIN),
   });
 
-  await new Promise<void>((resolve, reject) => {
+  await new Promise<void>((resolvePromise, reject) => {
     const handleError = (error: Error): void => {
       server.off('error', handleError);
       reject(error);
@@ -138,7 +163,7 @@ export async function startServer(port = resolvePort(process.env.PORT)): Promise
 
     const handleListening = (): void => {
       server.off('error', handleError);
-      resolve();
+      resolvePromise();
     };
 
     server.once('error', handleError);

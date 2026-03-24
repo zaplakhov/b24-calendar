@@ -1,19 +1,21 @@
 /*
 Module: bitrix.service
-Role: Wraps the Bitrix24 REST webhook surface for calendar reads and mutations used by the sync MVP.
+Role: Wraps the Bitrix24 REST API for scoped calendar reads and mutations in OAuth-based local app mode.
 Source of Truth: backend/src/services/bitrix.service.ts
 
 Uses:
-  ../services/sqlite.service.ts:SQLiteService: true
+  ./sqlite.service.ts:SQLiteService: true
+  ./bitrix-auth.service.ts:BitrixAuthService: true
   ../utils/transformer.ts:BitrixCalendarEvent: true
 
 Used by:
-  ../routes/settings.routes.ts:createSettingsRouter: true
+  ../routes/onboarding.routes.ts:createOnboardingRouter: true
   ../services/sync.service.ts:SyncService: true
 
 Glossary: none
 */
 
+import { BitrixAuthService } from './bitrix-auth.service';
 import { SQLiteService, type PersistedCalendar } from './sqlite.service';
 import type { BitrixCalendarDraft, BitrixCalendarEvent } from '../utils/transformer';
 
@@ -56,15 +58,18 @@ function normalizeBitrixEvent(payload: BitrixPayload): BitrixCalendarEvent {
 }
 
 export class BitrixService {
-  public constructor(private readonly sqliteService: SQLiteService) {}
+  public constructor(
+    private readonly sqliteService: SQLiteService,
+    private readonly bitrixAuthService: BitrixAuthService,
+  ) {}
 
-  public async fetchCalendars(): Promise<PersistedCalendar[]> {
-    const result = await this.call<unknown[]>('calendar.section.get', {
+  public async fetchCalendars(connectionId: string): Promise<PersistedCalendar[]> {
+    const result = await this.call<unknown[]>(connectionId, 'calendar.section.get', {
       type: 'user',
     });
 
     return (Array.isArray(result) ? result : []).map((item) => {
-      const payload = typeof item === 'object' && item ? (item as Record<string, unknown>) : {};
+      const payload = typeof item === 'object' && item ? item as Record<string, unknown> : {};
       const id = String(payload.ID ?? payload.id ?? '');
 
       return {
@@ -78,12 +83,16 @@ export class BitrixService {
     });
   }
 
-  public async listEventsSince(since: string | null): Promise<BitrixCalendarEvent[]> {
-    const settings = this.sqliteService.getSettings();
-    const result = await this.call<unknown[]>('calendar.event.list', {
+  public async listEventsSince(connectionId: string, since: string | null): Promise<BitrixCalendarEvent[]> {
+    const context = this.sqliteService.getConnectionContext(connectionId);
+    if (!context) {
+      throw new Error(`Connection ${connectionId} was not found.`);
+    }
+
+    const result = await this.call<unknown[]>(connectionId, 'calendar.event.list', {
       filter: {
         from: since,
-        section: settings.bitrixCalendarId || undefined,
+        section: context.connection.bitrixCalendarId || undefined,
       },
       type: 'user',
     });
@@ -91,8 +100,8 @@ export class BitrixService {
     return (Array.isArray(result) ? result : []).map((item) => normalizeBitrixEvent((item ?? {}) as BitrixPayload));
   }
 
-  public async fetchEventById(eventId: string): Promise<BitrixCalendarEvent | null> {
-    const result = await this.call<unknown>('calendar.event.get', {
+  public async fetchEventById(connectionId: string, eventId: string): Promise<BitrixCalendarEvent | null> {
+    const result = await this.call<unknown>(connectionId, 'calendar.event.get', {
       id: eventId,
     });
 
@@ -107,12 +116,16 @@ export class BitrixService {
     return normalizeBitrixEvent(result as BitrixPayload);
   }
 
-  public async createEvent(draft: BitrixCalendarDraft): Promise<BitrixCalendarEvent> {
-    const settings = this.sqliteService.getSettings();
-    const result = await this.call<unknown>('calendar.event.add', {
+  public async createEvent(connectionId: string, draft: BitrixCalendarDraft): Promise<BitrixCalendarEvent> {
+    const context = this.sqliteService.getConnectionContext(connectionId);
+    if (!context) {
+      throw new Error(`Connection ${connectionId} was not found.`);
+    }
+
+    const result = await this.call<unknown>(connectionId, 'calendar.event.add', {
       type: 'user',
-      ownerId: settings.bitrixUserId || undefined,
-      section: settings.bitrixCalendarId || undefined,
+      ownerId: context.connection.bitrixUserId,
+      section: context.connection.bitrixCalendarId || undefined,
       name: draft.title,
       description: draft.description ?? '',
       from: draft.startsAt,
@@ -121,7 +134,7 @@ export class BitrixService {
     });
 
     if (typeof result === 'number' || typeof result === 'string') {
-      const event = await this.fetchEventById(String(result));
+      const event = await this.fetchEventById(connectionId, String(result));
       if (event) {
         return event;
       }
@@ -130,8 +143,8 @@ export class BitrixService {
     return normalizeBitrixEvent((result ?? {}) as BitrixPayload);
   }
 
-  public async updateEvent(eventId: string, draft: BitrixCalendarDraft): Promise<BitrixCalendarEvent> {
-    await this.call('calendar.event.update', {
+  public async updateEvent(connectionId: string, eventId: string, draft: BitrixCalendarDraft): Promise<BitrixCalendarEvent> {
+    await this.call(connectionId, 'calendar.event.update', {
       id: eventId,
       name: draft.title,
       description: draft.description ?? '',
@@ -140,7 +153,7 @@ export class BitrixService {
       skipTime: draft.isAllDay ? 'Y' : 'N',
     });
 
-    const refreshed = await this.fetchEventById(eventId);
+    const refreshed = await this.fetchEventById(connectionId, eventId);
     if (!refreshed) {
       throw new Error(`Bitrix event ${eventId} was not returned after update.`);
     }
@@ -148,8 +161,8 @@ export class BitrixService {
     return refreshed;
   }
 
-  public async deleteEvent(eventId: string): Promise<void> {
-    await this.call('calendar.event.delete', {
+  public async deleteEvent(connectionId: string, eventId: string): Promise<void> {
+    await this.call(connectionId, 'calendar.event.delete', {
       id: eventId,
     });
   }
@@ -158,31 +171,47 @@ export class BitrixService {
     return normalizeBitrixEvent(payload);
   }
 
-  private async call<T>(method: string, payload: Record<string, unknown>): Promise<T> {
-    const settings = this.sqliteService.getSettings();
-
-    if (!settings.bitrixWebhookUrl) {
-      throw new Error('Bitrix webhook URL is not configured.');
+  private async call<T>(connectionId: string, method: string, payload: Record<string, unknown>, allowRefreshRetry = true): Promise<T> {
+    const context = this.sqliteService.getConnectionContext(connectionId);
+    if (!context) {
+      throw new Error(`Connection ${connectionId} was not found.`);
     }
 
-    const baseUrl = settings.bitrixWebhookUrl.replace(/\/$/, '');
-    const response = await fetch(`${baseUrl}/${method}.json`, {
+    const accessToken = await this.bitrixAuthService.getValidAccessToken(context.installation.id);
+    const response = await fetch(`https://${context.installation.portalHost}/rest/${method}.json`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        ...payload,
+        auth: accessToken,
+      }),
     });
+
+    const envelope = (await response.json()) as BitrixResponseEnvelope<T>;
+    if ((!response.ok || envelope.error) && allowRefreshRetry && this.isRefreshableBitrixError(response.status, envelope.error)) {
+      await this.bitrixAuthService.refreshInstallationAuth(context.installation);
+      return this.call<T>(connectionId, method, payload, false);
+    }
 
     if (!response.ok) {
       throw new Error(`Bitrix request failed with status ${response.status} for ${method}.`);
     }
 
-    const envelope = (await response.json()) as BitrixResponseEnvelope<T>;
     if (envelope.error) {
       throw new Error(envelope.error_description ?? envelope.error);
     }
 
     return envelope.result as T;
+  }
+
+  private isRefreshableBitrixError(statusCode: number, errorCode: string | undefined): boolean {
+    if (statusCode === 401) {
+      return true;
+    }
+
+    const normalized = (errorCode ?? '').toLowerCase();
+    return normalized.includes('expired') || normalized.includes('invalid_token') || normalized.includes('token');
   }
 }
