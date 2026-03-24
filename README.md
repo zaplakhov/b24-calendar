@@ -1,47 +1,47 @@
 # b24-calendar MVP
 
-Minimal MVP scaffold for syncing Bitrix24 calendar events into Yandex Calendar with SQLite-backed settings, webhook intake, manual resync, and an embedded settings page.
+Минимальный MVP-каркас для синхронизации событий календаря Bitrix24 с Яндекс Календарём с настройками на SQLite, приёмом вебхуков, ручной ресинхронизацией и встроенной страницей настроек.
 
-## What is included
+## Что включено
 
-- SQLite bootstrap for single-user settings, provider calendar cache, sync state, and event mappings
-- Settings API with calendar discovery endpoints
-- Bitrix REST service skeleton for calendar/event CRUD
-- Yandex CalDAV service wrapper for calendar/event CRUD
-- Sync orchestration with webhook intake, Yandex polling, recurrence skip, and mapping-based idempotency
-- Embedded frontend at `/embedded/settings`
-- Dockerfile and example environment variables
+- Bootstrap SQLite для настроек одиночного пользователя, кеша календарей провайдера, состояния синхронизации и маппинга событий
+- API настроек с эндпоинтами для обнаружения календарей
+- Скелет REST-сервиса Bitrix для CRUD календарей/событий
+- Обёртка CalDAV-сервиса Яндекс для CRUD календарей/событий
+- Оркестрация синхронизации с приёмом вебхуков, поллингом Яндекс, пропуском повторяющихся событий и идемпотентностью на основе маппинга
+- Встроенный фронтенд по адресу `/embedded/settings`
+- Dockerfile и пример переменных окружения
 
-## Local run
+## Локальный запуск
 
-1. Copy `.env.example` into your runtime environment.
-2. Install backend dependencies:
+1. Скопируйте `.env.example` в ваше окружение выполнения.
+2. Установите зависимости бэкенда:
 
    `npm install --prefix backend`
 
-3. Build the backend:
+3. Соберите бэкенд:
 
    `npm run build --prefix backend`
 
-4. Start the backend:
+4. Запустите бэкенд:
 
     `npm start --prefix backend`
 
-The clean-checkout path is intentionally lockfile-free for this MVP: local builds use `npm install --prefix backend`, and Docker uses the same install step inside the image.
+Путь без lock-файлов выбран намеренно для этого MVP: локальные сборки используют `npm install --prefix backend`, а Docker использует тот же шаг установки внутри образа.
 
-## Docker run
+## Запуск в Docker
 
-Build from the repository root:
+Собрать из корня репозитория:
 
 `docker build -t b24-calendar-sync .`
 
-Run with a mounted volume so SQLite survives restarts:
+Запустить с примонтированным томом, чтобы SQLite переживал перезапуски:
 
 `docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar-sync b24-calendar-sync`
 
-Default container behavior is safe for reviewers: `SYNC_ENABLED=false` and `SQLITE_DB_PATH=/data/b24-calendar.sqlite` until real Bitrix24 and Yandex credentials are saved through `/api/settings` or the embedded UI.
+Поведение контейнера по умолчанию безопасно для ревьюеров: `SYNC_ENABLED=false` и `SQLITE_DB_PATH=/data/b24-calendar.sqlite`, пока реальные реквизиты Bitrix24 и Яндекс не будут сохранены через `/api/settings` или встроенный UI.
 
-## Main endpoints
+## Основные эндпоинты
 
 - `GET /health`
 - `GET /api/settings`
@@ -52,26 +52,26 @@ Default container behavior is safe for reviewers: `SYNC_ENABLED=false` and `SQLI
 - `POST /api/webhook/bitrix`
 - `GET /embedded/settings`
 
-Reviewer-facing evidence is available directly in API responses:
+Доказательства для ревьюеров доступны напрямую в API-ответах:
 
-- `GET /api/settings` includes current settings, persisted Yandex calendar cache, and reviewer evidence for `lastSync`, `lastError`, and discovered calendars.
-- `GET /api/sync/status` includes reviewer evidence for processed counts, skipped recurring items, status hint (`ready` / `disabled` / `not_configured`), and the latest outcome reason.
-- `POST /api/sync/run` returns the manual resync result plus the same reviewer evidence block.
+- `GET /api/settings` включает текущие настройки, кеш календарей Яндекс и доказательства для ревьюеров: `lastSync`, `lastError` и обнаруженные календари.
+- `GET /api/sync/status` включает доказательства для ревьюеров: количества обработанных элементов, пропущенные повторяющиеся события, подсказка статуса (`ready` / `disabled` / `not_configured`) и последняя причина результата.
+- `POST /api/sync/run` возвращает результат ручной ресинхронизации плюс тот же блок доказательств для ревьюеров.
 
-## Manual verification checklist
+## Чеклист ручной проверки
 
-1. Save Bitrix24 + Yandex credentials via `PUT /api/settings` or `/embedded/settings` and confirm `GET /api/settings` shows `reviewerEvidence.syncStatus` plus persisted values after restart.
-2. Load Yandex calendars via `GET /api/settings/yandex/calendars` and confirm `reviewerEvidence.calendarsDiscovered > 0`.
-3. Trigger Bitrix24 create/update/delete and verify the paired Yandex object is created/updated/deleted without duplicate recreation after repeated webhook delivery.
-4. Trigger Yandex create/update/delete, run `POST /api/sync/run`, and verify Bitrix24 reflects the same create/update/delete outcome after polling.
-5. Create a recurring event on either side and verify sync stays healthy while the response evidence reports a skipped recurring item (check `reviewerEvidence.lastRun.skippedRecurringEvents` and `lastError` for skip message).
-6. Replay the same webhook payload twice and verify no duplicate events are created due to fingerprint-based idempotency.
-7. Run manual resync and confirm `processedBitrixEvents`, `processedYandexEvents`, `skippedRecurringEvents`, `lastSyncAt`, and `lastError` are visible in HTTP responses.
-8. Restart the Docker container with the same `/data` mount and verify settings, mappings, and sync status remain available.
+1. Сохраните реквизиты Bitrix24 и Яндекс через `PUT /api/settings` или `/embedded/settings` и подтвердите, что `GET /api/settings` показывает `reviewerEvidence.syncStatus` и сохранённые значения после перезапуска.
+2. Загрузите календари Яндекс через `GET /api/settings/yandex/calendars` и подтвердите `reviewerEvidence.calendarsDiscovered > 0`.
+3. Выполните create/update/delete в Bitrix24 и подтвердите, что парный объект Яндекс создаётся/обновляется/удаляется без дублирования при повторной доставке вебхука.
+4. Выполните create/update/delete в Яндекс, запустите `POST /api/sync/run` и подтвердите, что Bitrix24 отражает тот же результат после поллинга.
+5. Создайте повторяющееся событие на любой стороне и подтвердите, что синхронизация остаётся работоспособной, а доказательства в ответе сообщают о пропущенном повторяющемся событии (проверьте `reviewerEvidence.lastRun.skippedRecurringEvents` и `lastError` для сообщения о пропуске).
+6. Повторно отправьте тот же payload вебхука и подтвердите, что дубликаты событий не создаются благодаря идемпотентности на основе отпечатков.
+7. Запустите ручную ресинхронизацию и подтвердите, что `processedBitrixEvents`, `processedYandexEvents`, `skippedRecurringEvents`, `lastSyncAt` и `lastError` видны в HTTP-ответах.
+8. Перезапустите контейнер Docker с тем же монтированием `/data` и подтвердите, что настройки, маппинги и статус синхронизации остаются доступными.
 
-## MVP limitations
+## Ограничения MVP
 
-- Bitrix REST payload normalization is pragmatic and may require portal-specific adjustments.
-- Recurring events are intentionally skipped.
-- Polling uses 10-15 minute jitter with persisted cursor and backoff after failures.
-- Secrets are persisted in SQLite for the single-user MVP and should be moved to stronger secret storage in production.
+- Нормализация REST-пейлоадов Bitrix прагматична и может потребовать доработок для конкретного портала.
+- Повторяющиеся события намеренно пропускаются.
+- Поллинг использует джиттер 10-15 минут с сохранённым курсором и отложенной попыткой после сбоев.
+- Секреты сохраняются в SQLite для MVP с одним пользователем и должны быть перенесены в более надёжное хранилище секретов в production.
