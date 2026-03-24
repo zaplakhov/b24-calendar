@@ -89,11 +89,14 @@ export class BitrixService {
       throw new Error(`Connection ${connectionId} was not found.`);
     }
 
-    const result = await this.call<unknown[]>(connectionId, 'calendar.event.list', {
-      filter: {
-        from: since,
-        section: context.connection.bitrixCalendarId || undefined,
-      },
+    const from = since ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const to = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+
+    const result = await this.call<unknown[]>(connectionId, 'calendar.event.get', {
+      from,
+      ownerId: Number(context.connection.bitrixUserId),
+      section: context.connection.bitrixCalendarId ? [Number(context.connection.bitrixCalendarId)] : undefined,
+      to,
       type: 'user',
     });
 
@@ -101,7 +104,7 @@ export class BitrixService {
   }
 
   public async fetchEventById(connectionId: string, eventId: string): Promise<BitrixCalendarEvent | null> {
-    const result = await this.call<unknown>(connectionId, 'calendar.event.get', {
+    const result = await this.call<unknown>(connectionId, 'calendar.event.getbyid', {
       id: eventId,
     });
 
@@ -124,8 +127,8 @@ export class BitrixService {
 
     const result = await this.call<unknown>(connectionId, 'calendar.event.add', {
       type: 'user',
-      ownerId: context.connection.bitrixUserId,
-      section: context.connection.bitrixCalendarId || undefined,
+      ownerId: Number(context.connection.bitrixUserId),
+      section: context.connection.bitrixCalendarId ? Number(context.connection.bitrixCalendarId) : undefined,
       name: draft.title,
       description: draft.description ?? '',
       from: draft.startsAt,
@@ -144,8 +147,16 @@ export class BitrixService {
   }
 
   public async updateEvent(connectionId: string, eventId: string, draft: BitrixCalendarDraft): Promise<BitrixCalendarEvent> {
+    const context = this.sqliteService.getConnectionContext(connectionId);
+    if (!context) {
+      throw new Error(`Connection ${connectionId} was not found.`);
+    }
+
     await this.call(connectionId, 'calendar.event.update', {
       id: eventId,
+      type: 'user',
+      ownerId: Number(context.connection.bitrixUserId),
+      section: context.connection.bitrixCalendarId ? Number(context.connection.bitrixCalendarId) : undefined,
       name: draft.title,
       description: draft.description ?? '',
       from: draft.startsAt,
