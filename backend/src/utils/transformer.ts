@@ -276,8 +276,12 @@ function ensureAllDayEnd(startIso: string, endIso: string | null): string {
   return nextDay.toISOString();
 }
 
+function normalizeIcsText(ics: string): string {
+  return ics.replace(/\r\n[ \t]/g, '').replace(/\r\n/g, '\n');
+}
+
 function extractIcsFieldLines(ics: string, fieldName: string): string[] {
-  const unfolded = ics.replace(/\r\n[ \t]/g, '');
+  const unfolded = normalizeIcsText(ics);
   const pattern = new RegExp(`(?:^|\\n)${fieldName}(?:;[^:]+)?:([^\\n]+)`, 'gi');
   const values: string[] = [];
 
@@ -293,7 +297,7 @@ function extractIcsField(ics: string, fieldName: string): string | null {
 }
 
 function extractIcsProperty(ics: string, fieldName: string): { params: Record<string, string>; value: string } | null {
-  const unfolded = ics.replace(/\r\n[ \t]/g, '');
+  const unfolded = normalizeIcsText(ics);
   const match = unfolded.match(new RegExp(`(?:^|\\n)${fieldName}((?:;[^:\\n]+)*)?:([^\\n]+)`, 'i'));
   if (!match) {
     return null;
@@ -311,6 +315,16 @@ function extractIcsProperty(ics: string, fieldName: string): { params: Record<st
     params,
     value: match[2].trim(),
   };
+}
+
+function extractIcsComponent(ics: string, componentName: string): string | null {
+  const unfolded = normalizeIcsText(ics);
+  const match = unfolded.match(new RegExp(`BEGIN:${componentName}\\n([\\s\\S]*?)\\nEND:${componentName}`, 'i'));
+  if (!match) {
+    return null;
+  }
+
+  return `BEGIN:${componentName}\n${match[1]}\nEND:${componentName}`;
 }
 
 function isIsoDateSupported(value: string): boolean {
@@ -389,7 +403,7 @@ function parseOrganizerFromIcs(ics: string): EventOrganizer | null {
 }
 
 function parseAttendeesFromIcs(ics: string): EventAttendee[] {
-  const unfolded = ics.replace(/\r\n[ \t]/g, '');
+  const unfolded = normalizeIcsText(ics);
   const matches = [...unfolded.matchAll(/(?:^|\n)ATTENDEE((?:;[^:\n]+)*)?:([^\n]+)/gi)];
 
   return matches.map((match) => {
@@ -744,12 +758,13 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
 }
 
 export function parseYandexCalendarObject(rawIcs: string, url: string, etag: string | null): NormalizationResult<YandexCalendarEvent> {
-  const dtStartProp = extractIcsProperty(rawIcs, 'DTSTART');
-  const dtEndProp = extractIcsProperty(rawIcs, 'DTEND');
-  const timezone = normalizeText(extractIcsField(rawIcs, 'X-B24-TIMEZONE')) ?? normalizeText(dtStartProp?.params.TZID) ?? DEFAULT_TIMEZONE;
+  const eventIcs = extractIcsComponent(rawIcs, 'VEVENT') ?? rawIcs;
+  const dtStartProp = extractIcsProperty(eventIcs, 'DTSTART');
+  const dtEndProp = extractIcsProperty(eventIcs, 'DTEND');
+  const timezone = normalizeText(extractIcsField(eventIcs, 'X-B24-TIMEZONE')) ?? normalizeText(dtStartProp?.params.TZID) ?? DEFAULT_TIMEZONE;
   const dtStart = parseIcsDate(dtStartProp?.value ?? null, timezone);
   const dtEnd = parseIcsDate(dtEndProp?.value ?? null, timezone);
-  const recurrenceRule = normalizeText(extractIcsField(rawIcs, 'RRULE'));
+  const recurrenceRule = normalizeText(extractIcsField(eventIcs, 'RRULE'));
 
   if (recurrenceRule) {
     return {
@@ -808,21 +823,21 @@ export function parseYandexCalendarObject(rawIcs: string, url: string, etag: str
     value: {
       url,
       etag,
-      uid: extractIcsField(rawIcs, 'UID') ?? buildDeterministicUid(url),
-      summary: decodeIcsValue(extractIcsField(rawIcs, 'SUMMARY')) ?? 'Untitled event',
-      description: normalizeText(decodeIcsValue(extractIcsField(rawIcs, 'DESCRIPTION'))),
+      uid: extractIcsField(eventIcs, 'UID') ?? buildDeterministicUid(url),
+      summary: decodeIcsValue(extractIcsField(eventIcs, 'SUMMARY')) ?? 'Untitled event',
+      description: normalizeText(decodeIcsValue(extractIcsField(eventIcs, 'DESCRIPTION'))),
       startsAt: dtStart.iso,
       endsAt: normalizedEnd,
       isAllDay: dtStart.isAllDay,
-      updatedAt: parseIcsDate(extractIcsField(rawIcs, 'DTSTAMP'), DEFAULT_TIMEZONE)?.iso ?? null,
+      updatedAt: parseIcsDate(extractIcsField(eventIcs, 'DTSTAMP'), DEFAULT_TIMEZONE)?.iso ?? null,
       recurrenceRule,
-      location: normalizeText(decodeIcsValue(extractIcsField(rawIcs, 'LOCATION'))),
-      organizer: parseOrganizerFromIcs(rawIcs),
-      status: normalizeText(extractIcsField(rawIcs, 'STATUS')),
-      transparency: normalizeText(extractIcsField(rawIcs, 'TRANSP')),
-      attendees: parseAttendeesFromIcs(rawIcs),
+      location: normalizeText(decodeIcsValue(extractIcsField(eventIcs, 'LOCATION'))),
+      organizer: parseOrganizerFromIcs(eventIcs),
+      status: normalizeText(extractIcsField(eventIcs, 'STATUS')),
+      transparency: normalizeText(extractIcsField(eventIcs, 'TRANSP')),
+      attendees: parseAttendeesFromIcs(eventIcs),
       timezone,
-      preserved: parsePreservedField(rawIcs),
+      preserved: parsePreservedField(eventIcs),
       rawIcs,
     },
   };

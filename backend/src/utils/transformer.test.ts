@@ -103,6 +103,41 @@ test('transformer returns explicit recurring skip for Yandex objects', () => {
   }
 });
 
+test('transformer ignores VTIMEZONE recurrence rules for single Yandex events', () => {
+  const parsed = parseYandexCalendarObject([
+    'BEGIN:VCALENDAR',
+    'BEGIN:VTIMEZONE',
+    'TZID:Europe/Moscow',
+    'BEGIN:STANDARD',
+    'RRULE:FREQ=YEARLY;UNTIL=20101030T230000Z;BYMONTH=10;BYDAY=-1SU',
+    'DTSTART:20100328T020000',
+    'TZOFFSETFROM:+0400',
+    'TZOFFSETTO:+0300',
+    'END:STANDARD',
+    'END:VTIMEZONE',
+    'BEGIN:VEVENT',
+    'UID:event-vtimezone',
+    'SUMMARY:Single event with timezone rules',
+    'DTSTAMP:20260324T184738Z',
+    'DTSTART;TZID=Europe/Moscow:20260115T130000',
+    'DTEND;TZID=Europe/Moscow:20260115T140000',
+    'END:VEVENT',
+    'END:VCALENDAR',
+    '',
+  ].join('\r\n'), 'https://caldav.yandex.ru/timezone-single.ics', 'etag-vtimezone');
+
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) {
+    return;
+  }
+
+  assert.equal(parsed.value.uid, 'event-vtimezone');
+  assert.equal(parsed.value.recurrenceRule, null);
+  assert.equal(parsed.value.timezone, 'Europe/Moscow');
+  assert.equal(parsed.value.startsAt, '2026-01-15T10:00:00.000Z');
+  assert.equal(parsed.value.endsAt, '2026-01-15T11:00:00.000Z');
+});
+
 test('transformer applies TZID policy for inbound Yandex floating datetimes', () => {
   const parsed = parseYandexCalendarObject([
     'BEGIN:VCALENDAR',
