@@ -30,7 +30,7 @@ import {
 } from '../utils/transformer';
 import { BitrixService } from './bitrix.service';
 import { SQLiteService, type ConnectionSettings, type SyncState } from './sqlite.service';
-import { YandexCalDavService } from './yandex-caldav.service';
+import { YandexCalDavService, YandexCalendarObjectNotFoundError } from './yandex-caldav.service';
 import { syncDebug, syncError, syncInfo, syncVerbose, syncWarn } from '../utils/sync-debug';
 
 export interface SyncStatusResponse {
@@ -92,6 +92,27 @@ interface SyncExecutionStats {
   processedYandexEvents: number;
   skippedRecurringEvents: number;
   outcomeReason: string;
+}
+
+function isBitrixEventDateInvalid(event: BitrixCalendarEvent): boolean {
+  const startMs = Date.parse(event.startsAt);
+  const endMs = Date.parse(event.endsAt);
+
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+    return true;
+  }
+
+  const start = new Date(startMs);
+  const end = new Date(endMs);
+  if (start.getUTCFullYear() < 2000 || end.getUTCFullYear() < 2000) {
+    return true;
+  }
+
+  if (event.isAllDay) {
+    return endMs < startMs;
+  }
+
+  return endMs <= startMs;
 }
 
 export class SyncService {
@@ -370,8 +391,17 @@ export class SyncService {
     });
 
     for (const event of bitrixEvents) {
-      const skipped = await this.syncBitrixEvent(connectionId, event);
-      skippedRecurringEvents += skipped ? 1 : 0;
+      try {
+        const skipped = await this.syncBitrixEvent(connectionId, event);
+        skippedRecurringEvents += skipped ? 1 : 0;
+      } catch (error: unknown) {
+        syncWarn('Bitrix event failed during sync and was skipped.', {
+          connectionId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          eventId: event.id,
+          phase: 'sync.bitrixEvent.error',
+        });
+      }
     }
 
     const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, startedAt);
@@ -448,8 +478,18 @@ export class SyncService {
       }
 
       processedEvents += 1;
-      const skipped = await this.syncYandexEvent(connectionId, event);
-      skippedRecurringEvents += skipped ? 1 : 0;
+      try {
+        const skipped = await this.syncYandexEvent(connectionId, event);
+        skippedRecurringEvents += skipped ? 1 : 0;
+      } catch (error: unknown) {
+        syncWarn('Yandex event failed during sync and was skipped.', {
+          connectionId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          phase: 'sync.yandexEvent.error',
+          uid: event.uid,
+          url: event.url,
+        });
+      }
     }
 
     const mappings = this.sqliteService.listEventMappings(connectionId);
@@ -539,6 +579,18 @@ export class SyncService {
       return true;
     }
 
+    if (isBitrixEventDateInvalid(event)) {
+      syncWarn('Bitrix event skipped due to invalid dates.', {
+        connectionId,
+        endsAt: event.endsAt,
+        eventId: event.id,
+        phase: 'sync.bitrixEvent.skip',
+        reason: 'invalid_dates',
+        startsAt: event.startsAt,
+      });
+      return true;
+    }
+
     const mapping = this.sqliteService.getEventMappingByBitrixId(connectionId, event.id);
     const fingerprint = buildBitrixEventFingerprint(event);
     const decision = resolveConflict({
@@ -576,9 +628,28 @@ export class SyncService {
       eventId: event.id,
       phase: 'sync.bitrixToYandex.request',
     });
-    const syncedEvent = decision.action === 'create' || !mapping?.yandexEventUrl
-      ? await this.yandexService.createEvent(connectionId, draft)
-      : await this.yandexService.updateEvent(connectionId, mapping.yandexEventUrl, draft);
+    let syncedEvent;
+
+    if (decision.action === 'create' || !mapping?.yandexEventUrl) {
+      syncedEvent = await this.yandexService.createEvent(connectionId, draft);
+    } else {
+      try {
+        syncedEvent = await this.yandexService.updateEvent(connectionId, mapping.yandexEventUrl, draft);
+      } catch (error: unknown) {
+        if (error instanceof YandexCalendarObjectNotFoundError) {
+          syncWarn('Detected stale Yandex mapping, deleting and recreating object.', {
+            bitrixEventId: event.id,
+            connectionId,
+            phase: 'sync.bitrixToYandex.staleMapping',
+            staleUrl: mapping.yandexEventUrl,
+          });
+          this.sqliteService.deleteEventMappingByBitrixId(connectionId, event.id);
+          syncedEvent = await this.yandexService.createEvent(connectionId, draft);
+        } else {
+          throw error;
+        }
+      }
+    }
 
     syncVerbose({
       connectionId,
@@ -871,11 +942,7 @@ export class SyncService {
   }
 
   private computeNextDelay(schedule: PollingSchedule): number {
-    const states = this.sqliteService.listActiveConnections().map((item) => this.sqliteService.getSyncState(item.connection.id));
-    const maxFailureCount = states.reduce((max, state) => Math.max(max, state.pollingFailureCount), 0);
-    const fixedDelay = Math.max(1, Math.min(schedule.minDelayMs, schedule.maxDelayMs));
-    const cappedBackoffMultiplier = Math.min(4, Math.max(1, 2 ** maxFailureCount));
-    return fixedDelay * cappedBackoffMultiplier;
+    return Math.max(1, Math.min(schedule.minDelayMs, schedule.maxDelayMs));
   }
 
   private requireContext(connectionId: string): { connection: ConnectionSettings; installationReady: boolean } {

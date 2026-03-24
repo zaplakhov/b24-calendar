@@ -31,6 +31,13 @@ function getCalendarId(calendar: DAVCalendar): string {
   return calendar.url ?? calendar.displayName ?? 'yandex-calendar';
 }
 
+export class YandexCalendarObjectNotFoundError extends Error {
+  public constructor(public readonly url: string) {
+    super(`Yandex calendar object ${url} was not found.`);
+    this.name = 'YandexCalendarObjectNotFoundError';
+  }
+}
+
 export class YandexCalDavService {
   public constructor(private readonly sqliteService: SQLiteService) {}
 
@@ -161,7 +168,7 @@ export class YandexCalDavService {
     const existing = await this.findCalendarObjectByUrl(connectionId, client, url);
 
     if (!existing) {
-      throw new Error(`Yandex calendar object ${url} was not found.`);
+      throw new YandexCalendarObjectNotFoundError(url);
     }
 
     const iCalString = buildIcsEvent(draft);

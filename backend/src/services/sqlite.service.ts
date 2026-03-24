@@ -704,6 +704,14 @@ export class SQLiteService {
     return nextRecord;
   }
 
+  public deleteEventMappingByBitrixId(connectionId: string, bitrixEventId: string): void {
+    this.database.prepare<[string, string]>('DELETE FROM connection_event_mappings WHERE connection_id = ? AND bitrix_event_id = ?').run(connectionId, bitrixEventId);
+  }
+
+  public deleteEventMappingByYandexUrl(connectionId: string, yandexEventUrl: string): void {
+    this.database.prepare<[string, string]>('DELETE FROM connection_event_mappings WHERE connection_id = ? AND yandex_event_url = ?').run(connectionId, yandexEventUrl);
+  }
+
   public resetConnectionSync(connectionId: string): void {
     this.ensureScopedSyncState(connectionId);
     this.database.prepare<[string]>('DELETE FROM connection_event_mappings WHERE connection_id = ?').run(connectionId);
