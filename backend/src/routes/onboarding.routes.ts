@@ -50,6 +50,17 @@ function normalizeSettingsPatch(body: unknown): Partial<ConnectionSettings> {
   };
 }
 
+function isReadyForImmediateSync(settings: ConnectionSettings): boolean {
+  return Boolean(
+    settings.syncEnabled
+    && settings.bitrixCalendarId
+    && settings.yandexBaseUrl
+    && settings.yandexUsername
+    && settings.yandexPassword
+    && settings.yandexCalendarUrl,
+  );
+}
+
 function buildSettingsResponse(context: ConnectionContext, sqliteService: SQLiteService, syncService: SyncService) {
   const safeSettings = sanitizeConnectionSettingsForResponse(context.connection);
   const status = syncService.getStatus(context.connection.id);
@@ -109,7 +120,7 @@ export function createOnboardingRouter(dependencies: OnboardingRouterDependencie
   router.put('/:token', (request: Request, response: Response) => {
     const context = resolveContext(sqliteService, request.params.token);
     const nextSettings = sqliteService.updateConnectionSettings(context.connection.id, normalizeSettingsPatch(request.body));
-    if (nextSettings.syncEnabled && !context.connection.syncEnabled) {
+    if (isReadyForImmediateSync(nextSettings) && !context.connection.syncEnabled) {
       syncService.requestImmediateSync(context.connection.id, 'settings_enabled');
     }
 

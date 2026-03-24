@@ -612,7 +612,13 @@ export class SyncService {
       return 'disabled';
     }
 
-    return installationReady && Boolean(settings.yandexBaseUrl && settings.yandexUsername && settings.yandexPassword)
+    return installationReady && Boolean(
+      settings.bitrixCalendarId
+      && settings.yandexBaseUrl
+      && settings.yandexUsername
+      && settings.yandexPassword
+      && settings.yandexCalendarUrl,
+    )
       ? 'ready'
       : 'not_configured';
   }

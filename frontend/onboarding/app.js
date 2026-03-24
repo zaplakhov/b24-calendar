@@ -123,10 +123,7 @@ async function loadSettings() {
   fillSettings(payload);
 }
 
-async function saveSettings(event) {
-  event.preventDefault();
-  setBanner('Сохранение настроек...');
-
+async function persistCurrentSettings() {
   const payload = {
     bitrixCalendarId: fields.bitrixCalendarId.value,
     syncEnabled: fields.syncEnabled.checked,
@@ -138,10 +135,17 @@ async function saveSettings(event) {
     payload.yandexPassword = fields.yandexPassword.value;
   }
 
-  await fetchJson(endpoint(), {
+  return fetchJson(endpoint(), {
     body: JSON.stringify(payload),
     method: 'PUT',
   });
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  setBanner('Сохранение настроек...');
+
+  await persistCurrentSettings();
 
   await loadSettings();
   setBanner('Настройки сохранены.', 'success');
@@ -149,6 +153,10 @@ async function saveSettings(event) {
 
 async function loadCalendars(provider) {
   setBanner(`Загрузка календарей ${provider === 'bitrix' ? 'Bitrix24' : 'Яндекс'}...`);
+  if (provider === 'yandex') {
+    await persistCurrentSettings();
+  }
+
   const payload = await fetchJson(endpoint(`/${provider}/calendars`));
 
   state.calendars[provider] = payload.calendars || [];
