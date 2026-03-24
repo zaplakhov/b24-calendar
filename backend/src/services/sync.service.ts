@@ -31,6 +31,7 @@ import {
 import { BitrixService } from './bitrix.service';
 import { SQLiteService, type ConnectionSettings, type SyncState } from './sqlite.service';
 import { YandexCalDavService } from './yandex-caldav.service';
+import { syncDebug, syncError, syncInfo, syncVerbose, syncWarn } from '../utils/sync-debug';
 
 export interface SyncStatusResponse {
   configured: boolean;
@@ -352,12 +353,36 @@ export class SyncService {
     const bitrixEvents = await this.bitrixService.listEventsSince(connectionId, previousState.bitrixSyncCursor);
     let skippedRecurringEvents = 0;
 
+    syncDebug({
+      bitrixCursor: previousState.bitrixSyncCursor,
+      connectionId,
+      count: bitrixEvents.length,
+      events: bitrixEvents.map((event) => ({
+        calendarId: event.calendarId,
+        endsAt: event.endsAt,
+        eventId: event.id,
+        isAllDay: event.isAllDay,
+        startsAt: event.startsAt,
+        title: event.title,
+      })),
+      phase: 'sync.bitrixEvents.received',
+      selectedCalendarId: this.sqliteService.getConnectionById(connectionId)?.bitrixCalendarId ?? null,
+    });
+
     for (const event of bitrixEvents) {
       const skipped = await this.syncBitrixEvent(connectionId, event);
       skippedRecurringEvents += skipped ? 1 : 0;
     }
 
     const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, startedAt);
+
+    syncDebug({
+      connectionId,
+      phase: 'sync.incremental.completed',
+      processedBitrixEvents: bitrixEvents.length,
+      processedYandexEvents: yandexResult.processedEvents,
+      skippedRecurringEvents: skippedRecurringEvents + yandexResult.skippedRecurringEvents,
+    });
 
     return {
       processedBitrixEvents: bitrixEvents.length,
@@ -401,6 +426,21 @@ export class SyncService {
     const currentUrls = new Set(events.map((event) => event.url));
     let processedEvents = 0;
     let skippedRecurringEvents = 0;
+
+    syncDebug({
+      connectionId,
+      count: events.length,
+      events: events.map((event) => ({
+        endsAt: event.endsAt,
+        etag: event.etag,
+        startsAt: event.startsAt,
+        summary: event.summary,
+        uid: event.uid,
+        url: event.url,
+      })),
+      phase: 'sync.yandexEvents.received',
+      yandexCursor: previousState.yandexSyncCursor,
+    });
 
     for (const event of events) {
       if (!this.shouldProcessYandexEvent(connectionId, event, previousState.yandexSyncCursor)) {
@@ -460,8 +500,42 @@ export class SyncService {
   }
 
   private async syncBitrixEvent(connectionId: string, event: BitrixCalendarEvent): Promise<boolean> {
+    const selectedCalendarId = this.sqliteService.getConnectionById(connectionId)?.bitrixCalendarId ?? null;
+    syncDebug({
+      connectionId,
+      event: {
+        calendarId: event.calendarId,
+        endsAt: event.endsAt,
+        eventId: event.id,
+        isAllDay: event.isAllDay,
+        startsAt: event.startsAt,
+        title: event.title,
+        updatedAt: event.updatedAt,
+      },
+      phase: 'sync.bitrixEvent.inspect',
+      selectedCalendarId,
+    });
+
     if (shouldSkipRecurrence(event)) {
       this.noteRecurringSkip(connectionId, `Skipped Bitrix event ${event.id}: recurring events are unsupported in MVP.`);
+      syncWarn('Bitrix event skipped due to recurrence.', {
+        connectionId,
+        eventId: event.id,
+        phase: 'sync.bitrixEvent.skip',
+        reason: 'recurrence_unsupported',
+      });
+      return true;
+    }
+
+    if (selectedCalendarId && event.calendarId && event.calendarId !== selectedCalendarId) {
+      syncWarn('Bitrix event skipped due to section mismatch.', {
+        connectionId,
+        eventCalendarId: event.calendarId,
+        eventId: event.id,
+        phase: 'sync.bitrixEvent.skip',
+        reason: 'section_mismatch',
+        selectedCalendarId,
+      });
       return true;
     }
 
@@ -478,6 +552,14 @@ export class SyncService {
     });
 
     this.sqliteService.updateSyncState(connectionId, { lastOutcomeReason: decision.reason });
+    syncDebug({
+      connectionId,
+      decision,
+      eventId: event.id,
+      mapping,
+      phase: 'sync.bitrixEvent.decision',
+    });
+
     if (decision.action === 'skip') {
       return false;
     }
@@ -488,9 +570,22 @@ export class SyncService {
     }
 
     const draft = transformBitrixEventToYandexDraft(event);
+    syncDebug({
+      connectionId,
+      draft,
+      eventId: event.id,
+      phase: 'sync.bitrixToYandex.request',
+    });
     const syncedEvent = decision.action === 'create' || !mapping?.yandexEventUrl
       ? await this.yandexService.createEvent(connectionId, draft)
       : await this.yandexService.updateEvent(connectionId, mapping.yandexEventUrl, draft);
+
+    syncVerbose({
+      connectionId,
+      eventId: event.id,
+      phase: 'sync.bitrixToYandex.response',
+      syncedEvent,
+    });
 
     this.sqliteService.upsertEventMapping({
       connectionId,
@@ -514,8 +609,29 @@ export class SyncService {
   }
 
   private async syncYandexEvent(connectionId: string, event: YandexCalendarEvent): Promise<boolean> {
+    syncDebug({
+      connectionId,
+      event: {
+        endsAt: event.endsAt,
+        etag: event.etag,
+        startsAt: event.startsAt,
+        summary: event.summary,
+        uid: event.uid,
+        updatedAt: event.updatedAt,
+        url: event.url,
+      },
+      phase: 'sync.yandexEvent.inspect',
+    });
+
     if (shouldSkipRecurrence(event)) {
       this.noteRecurringSkip(connectionId, `Skipped Yandex event ${event.uid}: recurring events are unsupported in MVP.`);
+      syncWarn('Yandex event skipped due to recurrence.', {
+        connectionId,
+        phase: 'sync.yandexEvent.skip',
+        reason: 'recurrence_unsupported',
+        uid: event.uid,
+        url: event.url,
+      });
       return true;
     }
 
@@ -532,14 +648,38 @@ export class SyncService {
     });
 
     this.sqliteService.updateSyncState(connectionId, { lastOutcomeReason: decision.reason });
+    syncDebug({
+      connectionId,
+      decision,
+      mapping,
+      phase: 'sync.yandexEvent.decision',
+      uid: event.uid,
+      url: event.url,
+    });
+
     if (decision.action === 'skip') {
       return false;
     }
 
     const draft = transformYandexEventToBitrixDraft(event);
+    syncDebug({
+      connectionId,
+      draft,
+      phase: 'sync.yandexToBitrix.request',
+      uid: event.uid,
+      url: event.url,
+    });
     const syncedEvent = decision.action === 'update' && mapping?.bitrixEventId
       ? await this.bitrixService.updateEvent(connectionId, mapping.bitrixEventId, draft)
       : await this.bitrixService.createEvent(connectionId, draft);
+
+    syncVerbose({
+      connectionId,
+      phase: 'sync.yandexToBitrix.response',
+      syncedEvent,
+      uid: event.uid,
+      url: event.url,
+    });
 
     this.sqliteService.upsertEventMapping({
       connectionId,
@@ -756,11 +896,6 @@ export class SyncService {
   }
 
   private log(message: string, meta?: Record<string, unknown>): void {
-    if (meta) {
-      console.info(`[sync-service] ${message}`, meta);
-      return;
-    }
-
-    console.info(`[sync-service] ${message}`);
+    syncInfo(message, meta);
   }
 }

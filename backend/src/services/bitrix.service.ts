@@ -18,6 +18,7 @@ Glossary: none
 import { BitrixAuthService } from './bitrix-auth.service';
 import { SQLiteService, type PersistedCalendar } from './sqlite.service';
 import type { BitrixCalendarDraft, BitrixCalendarEvent } from '../utils/transformer';
+import { syncDebug, syncVerbose } from '../utils/sync-debug';
 
 interface BitrixResponseEnvelope<T> {
   result?: T;
@@ -96,9 +97,32 @@ export class BitrixService {
       throw new Error(`Connection ${connectionId} was not found.`);
     }
 
+    syncDebug({
+      connectionId,
+      ownerId: Number(context.connection.bitrixUserId),
+      phase: 'bitrix.fetchCalendars.request',
+      selectedCalendarId: context.connection.bitrixCalendarId || null,
+      type: 'user',
+    });
+
     const result = await this.call<unknown[]>(connectionId, 'calendar.section.get', {
       ownerId: Number(context.connection.bitrixUserId),
       type: 'user',
+    });
+
+    syncDebug({
+      calendars: (Array.isArray(result) ? result : []).map((item) => {
+        const payload = typeof item === 'object' && item ? item as Record<string, unknown> : {};
+        return {
+          id: payload.ID ?? payload.id ?? null,
+          name: payload.NAME ?? payload.name ?? null,
+          ownerId: payload.OWNER_ID ?? null,
+          type: payload.CAL_TYPE ?? null,
+        };
+      }),
+      connectionId,
+      count: Array.isArray(result) ? result.length : 0,
+      phase: 'bitrix.fetchCalendars.response',
     });
 
     return (Array.isArray(result) ? result : []).map((item) => {
@@ -125,6 +149,16 @@ export class BitrixService {
     const from = since ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     const to = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
 
+    syncDebug({
+      connectionId,
+      from,
+      ownerId: Number(context.connection.bitrixUserId),
+      phase: 'bitrix.listEvents.request',
+      section: context.connection.bitrixCalendarId ? [Number(context.connection.bitrixCalendarId)] : [],
+      to,
+      type: 'user',
+    });
+
     const result = await this.call<unknown[]>(connectionId, 'calendar.event.get', {
       from,
       ownerId: Number(context.connection.bitrixUserId),
@@ -133,12 +167,49 @@ export class BitrixService {
       type: 'user',
     });
 
+    syncDebug({
+      connectionId,
+      count: Array.isArray(result) ? result.length : 0,
+      events: (Array.isArray(result) ? result : []).map((item) => {
+        const payload = (item ?? {}) as BitrixPayload;
+        return {
+          end: payload.DATE_TO ?? payload.dateTo ?? payload.to ?? null,
+          id: payload.ID ?? payload.id ?? null,
+          sectionId: payload.SECT_ID ?? payload.sectionId ?? null,
+          skipTime: payload.SKIP_TIME ?? payload.skipTime ?? null,
+          start: payload.DATE_FROM ?? payload.dateFrom ?? payload.from ?? null,
+          title: payload.NAME ?? payload.name ?? null,
+        };
+      }),
+      phase: 'bitrix.listEvents.response',
+      selectedCalendarId: context.connection.bitrixCalendarId || null,
+    });
+
+    syncVerbose({
+      connectionId,
+      phase: 'bitrix.listEvents.rawResponse',
+      result,
+    });
+
     return (Array.isArray(result) ? result : []).map((item) => normalizeBitrixEvent((item ?? {}) as BitrixPayload));
   }
 
   public async fetchEventById(connectionId: string, eventId: string): Promise<BitrixCalendarEvent | null> {
+    syncDebug({
+      connectionId,
+      eventId,
+      phase: 'bitrix.fetchEventById.request',
+    });
+
     const result = await this.call<unknown>(connectionId, 'calendar.event.getbyid', {
       id: eventId,
+    });
+
+    syncVerbose({
+      connectionId,
+      eventId,
+      phase: 'bitrix.fetchEventById.response',
+      result,
     });
 
     if (!result) {
@@ -167,6 +238,14 @@ export class BitrixService {
       from: draft.startsAt,
       to: draft.endsAt,
       skipTime: draft.isAllDay ? 'Y' : 'N',
+    });
+
+    syncDebug({
+      connectionId,
+      draft,
+      phase: 'bitrix.createEvent.response',
+      result,
+      selectedCalendarId: context.connection.bitrixCalendarId || null,
     });
 
     if (typeof result === 'number' || typeof result === 'string') {
@@ -203,6 +282,14 @@ export class BitrixService {
       skipTime: draft.isAllDay ? 'Y' : 'N',
     });
 
+    syncDebug({
+      connectionId,
+      draft,
+      eventId,
+      phase: 'bitrix.updateEvent.completed',
+      selectedCalendarId: context.connection.bitrixCalendarId || null,
+    });
+
     try {
       const refreshed = await this.fetchEventById(connectionId, eventId);
       if (refreshed) {
@@ -219,6 +306,12 @@ export class BitrixService {
     await this.call(connectionId, 'calendar.event.delete', {
       id: eventId,
     });
+
+    syncDebug({
+      connectionId,
+      eventId,
+      phase: 'bitrix.deleteEvent.completed',
+    });
   }
 
   public normalizeWebhookEvent(payload: Record<string, unknown>): BitrixCalendarEvent {
@@ -232,6 +325,14 @@ export class BitrixService {
     }
 
     const accessToken = await this.bitrixAuthService.getValidAccessToken(context.installation.id);
+    syncDebug({
+      connectionId,
+      method,
+      payload,
+      phase: 'bitrix.call.request',
+      portalHost: context.installation.portalHost,
+    });
+
     const response = await fetch(`https://${context.installation.portalHost}/rest/${method}.json`, {
       method: 'POST',
       headers: {
@@ -244,6 +345,13 @@ export class BitrixService {
     });
 
     const envelope = (await response.json()) as BitrixResponseEnvelope<T>;
+    syncVerbose({
+      connectionId,
+      envelope,
+      method,
+      phase: 'bitrix.call.response',
+      status: response.status,
+    });
     if (response.status === 503 && allowRefreshRetry) {
       await new Promise((resolve) => setTimeout(resolve, 500));
       return this.call<T>(connectionId, method, payload, false);

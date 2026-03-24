@@ -25,6 +25,7 @@ import {
   type YandexCalendarDraft,
   type YandexCalendarEvent,
 } from '../utils/transformer';
+import { syncDebug, syncVerbose } from '../utils/sync-debug';
 
 function getCalendarId(calendar: DAVCalendar): string {
   return calendar.url ?? calendar.displayName ?? 'yandex-calendar';
@@ -36,6 +37,18 @@ export class YandexCalDavService {
   public async fetchCalendars(connectionId: string): Promise<PersistedCalendar[]> {
     const client = await this.createClient(connectionId);
     const calendars = await client.fetchCalendars();
+
+    syncDebug({
+      calendars: calendars.map((calendar) => ({
+        ctag: calendar.ctag ?? null,
+        displayName: calendar.displayName ?? null,
+        syncToken: calendar.syncToken ?? null,
+        url: calendar.url ?? null,
+      })),
+      connectionId,
+      count: calendars.length,
+      phase: 'yandex.fetchCalendars.response',
+    });
 
     return calendars.map((calendar) => ({
       provider: 'yandex' as const,
@@ -54,10 +67,34 @@ export class YandexCalDavService {
   public async listEvents(connectionId: string): Promise<YandexCalendarEvent[]> {
     const client = await this.createClient(connectionId);
     const calendar = await this.resolveSelectedCalendar(connectionId, client);
+    syncDebug({
+      calendarUrl: calendar.url ?? null,
+      connectionId,
+      displayName: calendar.displayName ?? null,
+      phase: 'yandex.listEvents.request',
+      useMultiGet: false,
+    });
+
     const objects = await client.fetchCalendarObjects({
       calendar,
       urlFilter: () => true,
       useMultiGet: false,
+    });
+
+    syncDebug({
+      connectionId,
+      count: objects.length,
+      objects: objects.map((item) => ({
+        etag: item.etag ?? null,
+        url: item.url,
+      })),
+      phase: 'yandex.listEvents.response',
+    });
+
+    syncVerbose({
+      connectionId,
+      objects,
+      phase: 'yandex.listEvents.rawObjects',
     });
 
     return objects.map((item) => parseYandexCalendarObject(item.data ?? '', item.url, item.etag ?? null));
@@ -80,6 +117,20 @@ export class YandexCalDavService {
     const calendar = await this.resolveSelectedCalendar(connectionId, client);
     const filename = `${draft.uid.replace(/[^a-zA-Z0-9_.-]/g, '-')}.ics`;
     const iCalString = buildIcsEvent(draft);
+    syncDebug({
+      calendarUrl: calendar.url ?? null,
+      connectionId,
+      draft,
+      filename,
+      phase: 'yandex.createEvent.request',
+    });
+    syncVerbose({
+      calendarUrl: calendar.url ?? null,
+      connectionId,
+      filename,
+      iCalString,
+      phase: 'yandex.createEvent.ics',
+    });
     const response = await client.createCalendarObject({
       calendar,
       filename,
@@ -93,6 +144,13 @@ export class YandexCalDavService {
 
     const location = response.headers.get('location');
     const createdUrl = location ? new URL(location, calendar.url ?? undefined).toString() : `${calendar.url ?? ''}${filename}`;
+    syncDebug({
+      connectionId,
+      createdUrl,
+      location,
+      phase: 'yandex.createEvent.response',
+      status: response.status,
+    });
     const refreshed = await this.getEventByUrl(connectionId, createdUrl).catch(() => null);
 
     return refreshed ?? parseYandexCalendarObject(iCalString, createdUrl, response.headers.get('etag'));
@@ -107,6 +165,18 @@ export class YandexCalDavService {
     }
 
     const iCalString = buildIcsEvent(draft);
+    syncDebug({
+      connectionId,
+      draft,
+      phase: 'yandex.updateEvent.request',
+      url,
+    });
+    syncVerbose({
+      connectionId,
+      iCalString,
+      phase: 'yandex.updateEvent.ics',
+      url,
+    });
     const response = await client.updateCalendarObject({
       calendarObject: {
         ...existing,
@@ -132,6 +202,13 @@ export class YandexCalDavService {
 
     const response = await client.deleteCalendarObject({
       calendarObject: existing,
+    });
+
+    syncDebug({
+      connectionId,
+      phase: 'yandex.deleteEvent.response',
+      status: response.status,
+      url,
     });
 
     if (!response.ok) {
@@ -160,6 +237,14 @@ export class YandexCalDavService {
       throw new Error('Yandex CalDAV credentials are not configured.');
     }
 
+    syncDebug({
+      connectionId,
+      phase: 'yandex.createClient',
+      serverUrl: settings.yandexBaseUrl,
+      username: settings.yandexUsername,
+      yandexCalendarUrl: settings.yandexCalendarUrl,
+    });
+
     return createDAVClient({
       authMethod: 'Basic',
       credentials: {
@@ -183,10 +268,22 @@ export class YandexCalDavService {
     }
 
     if (!context.connection.yandexCalendarUrl) {
+      syncDebug({
+        connectionId,
+        phase: 'yandex.resolveSelectedCalendar.default',
+        selectedCalendarUrl: calendars[0].url ?? null,
+      });
       return calendars[0];
     }
 
-    return calendars.find((calendar) => calendar.url === context.connection.yandexCalendarUrl) ?? calendars[0];
+    const selected = calendars.find((calendar) => calendar.url === context.connection.yandexCalendarUrl) ?? calendars[0];
+    syncDebug({
+      configuredCalendarUrl: context.connection.yandexCalendarUrl,
+      connectionId,
+      phase: 'yandex.resolveSelectedCalendar.selected',
+      selectedCalendarUrl: selected.url ?? null,
+    });
+    return selected;
   }
 
   private async findCalendarObjectByUrl(connectionId: string, client: Awaited<ReturnType<typeof createDAVClient>>, url: string): Promise<DAVCalendarObject | null> {
@@ -196,6 +293,14 @@ export class YandexCalDavService {
       objectUrls: [url],
       urlFilter: () => true,
       useMultiGet: false,
+    });
+
+    syncDebug({
+      connectionId,
+      count: objects.length,
+      phase: 'yandex.findObjectByUrl.response',
+      requestedUrl: url,
+      returnedUrls: objects.map((item) => item.url),
     });
 
     return objects.find((item) => item.url === url) ?? null;
