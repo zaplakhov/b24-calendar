@@ -144,6 +144,14 @@ docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calen
 6. Запустите `POST /api/onboarding/:token/sync/run` или кнопку `Синхронизировать сейчас`.
 7. Проверьте, что статусы и reviewer evidence обновляются.
 
+## Automated verification
+
+- Запускайте команды из `backend/` и используйте repo-relative пути без machine-specific absolute paths.
+- Combined verification: `NODE_PATH="./node_modules" ./node_modules/.bin/tsx --test src/utils/transformer.test.ts src/services/sync.service.test.ts src/routes/onboarding.routes.test.ts && node ./node_modules/typescript/bin/tsc -p tsconfig.json --typeRoots ./node_modules/@types`
+- `NODE_PATH="./node_modules" ./node_modules/.bin/tsx --test src/utils/transformer.test.ts src/services/sync.service.test.ts src/routes/onboarding.routes.test.ts`
+- `node ./node_modules/typescript/bin/tsc -p tsconfig.json --typeRoots ./node_modules/@types`
+- Recurring events по-прежнему intentionally skipped и в тестах должны давать явные reason-coded skips, а не partial sync.
+
 ## Поведение синхронизации
 
 - Автоматический polling работает в обе стороны каждые 5 минут.

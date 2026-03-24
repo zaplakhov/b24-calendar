@@ -7,7 +7,7 @@ Uses:
   tsdav:createDAVClient: true
   ../services/sqlite.service.ts:SQLiteService: true
   ../utils/transformer.ts:buildIcsEvent: true
-  ../utils/transformer.ts:parseYandexCalendarObject: true
+  ../utils/transformer.ts:NormalizationResult: true
 
 Used by:
   ../routes/onboarding.routes.ts:createOnboardingRouter: true
@@ -16,16 +16,77 @@ Used by:
 Glossary: none
 */
 
-import { createDAVClient, type DAVCalendar, type DAVCalendarObject } from 'tsdav';
-
 import { SQLiteService, type PersistedCalendar } from './sqlite.service';
 import {
   buildIcsEvent,
   parseYandexCalendarObject,
+  type NormalizationResult,
+  type NormalizationDescriptor,
   type YandexCalendarDraft,
   type YandexCalendarEvent,
 } from '../utils/transformer';
 import { syncDebug, syncVerbose } from '../utils/sync-debug';
+
+interface DAVCalendar {
+  url?: string | null;
+  displayName?: string | null;
+  calendarColor?: string | null;
+  components?: string[] | null;
+  ctag?: string | null;
+  syncToken?: string | null;
+}
+
+interface DAVCalendarObject {
+  url: string;
+  etag?: string | null;
+  data?: string | null;
+}
+
+type DAVResponse = {
+  headers: Headers;
+  ok: boolean;
+  status: number;
+  text?: () => Promise<string>;
+};
+
+interface DAVClient {
+  fetchCalendars(): Promise<DAVCalendar[]>;
+  fetchCalendarObjects(options: {
+    calendar: DAVCalendar;
+    objectUrls?: string[];
+    urlFilter: (url: string) => boolean;
+    useMultiGet: boolean;
+  }): Promise<DAVCalendarObject[]>;
+  createCalendarObject(options: {
+    calendar: DAVCalendar;
+    filename: string;
+    iCalString: string;
+  }): Promise<DAVResponse>;
+  updateCalendarObject(options: {
+    calendarObject: DAVCalendarObject & { data: string };
+  }): Promise<DAVResponse>;
+  deleteCalendarObject(options: {
+    calendarObject: DAVCalendarObject;
+  }): Promise<DAVResponse>;
+}
+
+interface DAVClientOptions {
+  authMethod: 'Basic';
+  credentials: {
+    password: string;
+    username: string;
+  };
+  defaultAccountType: 'caldav';
+  serverUrl: string;
+}
+
+const { createDAVClient: rawCreateDAVClient } = require('tsdav') as {
+  createDAVClient: (options: DAVClientOptions) => Promise<DAVClient>;
+};
+
+function createDAVClient(options: DAVClientOptions): Promise<DAVClient> {
+  return rawCreateDAVClient(options);
+}
 
 function getCalendarId(calendar: DAVCalendar): string {
   return calendar.url ?? calendar.displayName ?? 'yandex-calendar';
@@ -35,6 +96,20 @@ export class YandexCalendarObjectNotFoundError extends Error {
   public constructor(public readonly url: string) {
     super(`Yandex calendar object ${url} was not found.`);
     this.name = 'YandexCalendarObjectNotFoundError';
+  }
+}
+
+export class YandexCalendarScopeError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'YandexCalendarScopeError';
+  }
+}
+
+export class YandexCalendarNormalizationError extends Error {
+  public constructor(public readonly issue: NormalizationDescriptor) {
+    super(`Yandex calendar object normalization failed: ${issue.reason}`);
+    this.name = 'YandexCalendarNormalizationError';
   }
 }
 
@@ -72,6 +147,11 @@ export class YandexCalDavService {
   }
 
   public async listEvents(connectionId: string): Promise<YandexCalendarEvent[]> {
+    const results = await this.listEventResults(connectionId);
+    return results.filter((result): result is { ok: true; value: YandexCalendarEvent } => result.ok).map((result) => result.value);
+  }
+
+  public async listEventResults(connectionId: string): Promise<Array<NormalizationResult<YandexCalendarEvent>>> {
     const client = await this.createClient(connectionId);
     const calendar = await this.resolveSelectedCalendar(connectionId, client);
     syncDebug({
@@ -119,6 +199,11 @@ export class YandexCalDavService {
     return events.find((event) => event.url === url) ?? null;
   }
 
+  public async findEventByUid(connectionId: string, uid: string): Promise<YandexCalendarEvent | null> {
+    const events = await this.listEvents(connectionId);
+    return events.find((event) => event.uid === uid) ?? null;
+  }
+
   public async createEvent(connectionId: string, draft: YandexCalendarDraft): Promise<YandexCalendarEvent> {
     const client = await this.createClient(connectionId);
     const calendar = await this.resolveSelectedCalendar(connectionId, client);
@@ -160,7 +245,12 @@ export class YandexCalDavService {
     });
     const refreshed = await this.getEventByUrl(connectionId, createdUrl).catch(() => null);
 
-    return refreshed ?? parseYandexCalendarObject(iCalString, createdUrl, response.headers.get('etag'));
+    const parsed = refreshed ? { ok: true as const, value: refreshed } : parseYandexCalendarObject(iCalString, createdUrl, response.headers.get('etag'));
+    if (!parsed.ok) {
+      throw new YandexCalendarNormalizationError(parsed.issue);
+    }
+
+    return parsed.value;
   }
 
   public async updateEvent(connectionId: string, url: string, draft: YandexCalendarDraft): Promise<YandexCalendarEvent> {
@@ -196,7 +286,12 @@ export class YandexCalDavService {
       throw new Error(`Yandex CalDAV update failed with status ${response.status}. Raw response: ${rawResponse}. ICS: ${iCalString}`);
     }
 
-    return parseYandexCalendarObject(iCalString, existing.url, response.headers.get('etag') ?? existing.etag ?? null);
+    const parsed = parseYandexCalendarObject(iCalString, existing.url, response.headers.get('etag') ?? existing.etag ?? null);
+    if (!parsed.ok) {
+      throw new YandexCalendarNormalizationError(parsed.issue);
+    }
+
+    return parsed.value;
   }
 
   public async deleteEvent(connectionId: string, url: string): Promise<void> {
@@ -224,7 +319,7 @@ export class YandexCalDavService {
     }
   }
 
-  private async readResponseBody(response: Response): Promise<string> {
+  private async readResponseBody(response: DAVResponse): Promise<string> {
     if (typeof response.text === 'function') {
       const body = await response.text().catch(() => '');
       return body || 'empty body';
@@ -233,7 +328,7 @@ export class YandexCalDavService {
     return JSON.stringify(response);
   }
 
-  private async createClient(connectionId: string) {
+  private async createClient(connectionId: string): Promise<DAVClient> {
     const context = this.sqliteService.getConnectionContext(connectionId);
     if (!context) {
       throw new Error(`Connection ${connectionId} was not found.`);
@@ -263,7 +358,7 @@ export class YandexCalDavService {
     });
   }
 
-  private async resolveSelectedCalendar(connectionId: string, client: Awaited<ReturnType<typeof createDAVClient>>): Promise<DAVCalendar> {
+  private async resolveSelectedCalendar(connectionId: string, client: DAVClient): Promise<DAVCalendar> {
     const context = this.sqliteService.getConnectionContext(connectionId);
     if (!context) {
       throw new Error(`Connection ${connectionId} was not found.`);
@@ -275,15 +370,14 @@ export class YandexCalDavService {
     }
 
     if (!context.connection.yandexCalendarUrl) {
-      syncDebug({
-        connectionId,
-        phase: 'yandex.resolveSelectedCalendar.default',
-        selectedCalendarUrl: calendars[0].url ?? null,
-      });
-      return calendars[0];
+      throw new YandexCalendarScopeError('Yandex calendar URL is not configured for this connection.');
     }
 
-    const selected = calendars.find((calendar) => calendar.url === context.connection.yandexCalendarUrl) ?? calendars[0];
+    const selected = calendars.find((calendar) => calendar.url === context.connection.yandexCalendarUrl);
+    if (!selected) {
+      throw new YandexCalendarScopeError(`Configured Yandex calendar ${context.connection.yandexCalendarUrl} was not found.`);
+    }
+
     syncDebug({
       configuredCalendarUrl: context.connection.yandexCalendarUrl,
       connectionId,
@@ -293,7 +387,7 @@ export class YandexCalDavService {
     return selected;
   }
 
-  private async findCalendarObjectByUrl(connectionId: string, client: Awaited<ReturnType<typeof createDAVClient>>, url: string): Promise<DAVCalendarObject | null> {
+  private async findCalendarObjectByUrl(connectionId: string, client: DAVClient, url: string): Promise<DAVCalendarObject | null> {
     const calendar = await this.resolveSelectedCalendar(connectionId, client);
     const objects = await client.fetchCalendarObjects({
       calendar,

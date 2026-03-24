@@ -6,7 +6,7 @@ Source of Truth: backend/src/services/bitrix.service.ts
 Uses:
   ./sqlite.service.ts:SQLiteService: true
   ./bitrix-auth.service.ts:BitrixAuthService: true
-  ../utils/transformer.ts:BitrixCalendarEvent: true
+  ../utils/transformer.ts:buildBitrixEventFromRaw: true
 
 Used by:
   ../routes/onboarding.routes.ts:createOnboardingRouter: true
@@ -17,7 +17,7 @@ Glossary: none
 
 import { BitrixAuthService } from './bitrix-auth.service';
 import { SQLiteService, type PersistedCalendar } from './sqlite.service';
-import type { BitrixCalendarDraft, BitrixCalendarEvent } from '../utils/transformer';
+import { buildBitrixEventFromRaw, type BitrixCalendarDraft, type BitrixCalendarEvent } from '../utils/transformer';
 import { syncDebug, syncVerbose } from '../utils/sync-debug';
 
 interface BitrixResponseEnvelope<T> {
@@ -27,36 +27,6 @@ interface BitrixResponseEnvelope<T> {
 }
 
 type BitrixPayload = Record<string, unknown>;
-
-function normalizeIsoDate(value: unknown): string {
-  if (typeof value === 'string' && value.trim().length > 0) {
-    const parsed = new Date(value);
-    if (!Number.isNaN(parsed.valueOf())) {
-      return parsed.toISOString();
-    }
-  }
-
-  return new Date().toISOString();
-}
-
-function normalizeBitrixEvent(payload: BitrixPayload): BitrixCalendarEvent {
-  const id = String(payload.ID ?? payload.id ?? '');
-
-  return {
-    id,
-    calendarId: payload.SECT_ID ? String(payload.SECT_ID) : payload.sectionId ? String(payload.sectionId) : null,
-    title: String(payload.NAME ?? payload.name ?? 'Untitled Bitrix event'),
-    description: payload.DESCRIPTION ? String(payload.DESCRIPTION) : payload.description ? String(payload.description) : null,
-    startsAt: normalizeIsoDate(payload.DATE_FROM ?? payload.dateFrom ?? payload.from),
-    endsAt: normalizeIsoDate(payload.DATE_TO ?? payload.dateTo ?? payload.to),
-    timezone: payload.TZ_FROM ? String(payload.TZ_FROM) : payload.timezone ? String(payload.timezone) : null,
-    isAllDay: String(payload.SKIP_TIME ?? payload.skipTime ?? 'N').toUpperCase() === 'Y',
-    updatedAt: payload.TIMESTAMP_X ? normalizeIsoDate(payload.TIMESTAMP_X) : payload.updatedAt ? normalizeIsoDate(payload.updatedAt) : null,
-    deleted: false,
-    recurrenceRule: payload.RRULE ? String(payload.RRULE) : payload.rrule ? String(payload.rrule) : null,
-    raw: payload,
-  };
-}
 
 function buildFallbackBitrixEvent(eventId: string, draft: BitrixCalendarDraft, calendarId: string | null): BitrixCalendarEvent {
   const timestamp = new Date().toISOString();
@@ -73,6 +43,12 @@ function buildFallbackBitrixEvent(eventId: string, draft: BitrixCalendarDraft, c
     updatedAt: timestamp,
     deleted: false,
     recurrenceRule: null,
+    location: draft.location ?? null,
+    organizer: draft.organizer ?? null,
+    status: draft.status ?? null,
+    transparency: draft.transparency ?? null,
+    attendees: draft.attendees ?? [],
+    preserved: draft.preserved ?? { deferredReasonCodes: [], rawAttendees: [], rawOrganizer: null, rawProperties: {} },
     raw: {
       ID: eventId,
       NAME: draft.title,
@@ -191,7 +167,7 @@ export class BitrixService {
       result,
     });
 
-    return (Array.isArray(result) ? result : []).map((item) => normalizeBitrixEvent((item ?? {}) as BitrixPayload));
+     return (Array.isArray(result) ? result : []).map((item) => buildBitrixEventFromRaw((item ?? {}) as BitrixPayload));
   }
 
   public async fetchEventById(connectionId: string, eventId: string): Promise<BitrixCalendarEvent | null> {
@@ -217,10 +193,10 @@ export class BitrixService {
     }
 
     if (Array.isArray(result)) {
-      return result.length > 0 ? normalizeBitrixEvent((result[0] ?? {}) as BitrixPayload) : null;
+       return result.length > 0 ? buildBitrixEventFromRaw((result[0] ?? {}) as BitrixPayload) : null;
     }
 
-    return normalizeBitrixEvent(result as BitrixPayload);
+    return buildBitrixEventFromRaw(result as BitrixPayload);
   }
 
   public async createEvent(connectionId: string, draft: BitrixCalendarDraft): Promise<BitrixCalendarEvent> {
@@ -261,7 +237,7 @@ export class BitrixService {
       return buildFallbackBitrixEvent(String(result), draft, context.connection.bitrixCalendarId || null);
     }
 
-    return normalizeBitrixEvent((result ?? {}) as BitrixPayload);
+    return buildBitrixEventFromRaw((result ?? {}) as BitrixPayload);
   }
 
   public async updateEvent(connectionId: string, eventId: string, draft: BitrixCalendarDraft): Promise<BitrixCalendarEvent> {
@@ -315,7 +291,7 @@ export class BitrixService {
   }
 
   public normalizeWebhookEvent(payload: Record<string, unknown>): BitrixCalendarEvent {
-    return normalizeBitrixEvent(payload);
+    return buildBitrixEventFromRaw(payload);
   }
 
   private async call<T>(connectionId: string, method: string, payload: Record<string, unknown>, allowRefreshRetry = true): Promise<T> {
