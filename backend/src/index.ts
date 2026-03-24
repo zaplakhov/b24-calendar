@@ -1,11 +1,13 @@
 /*
 Module: index
-Role: Creates and boots the minimal Express runtime for the backend service.
+Role: Creates and boots the minimal Express runtime for the backend service and mounts the public HTTP surface.
 Source of Truth: backend/src/index.ts
 
 Uses:
   express:express: true
   node:http:createServer: true
+  ./routes/settings.routes:createSettingsRouter: true
+  ./routes/sync.routes:createSyncRouter: true
 
 Used by:
   backend/package.json:start: true
@@ -17,18 +19,39 @@ Glossary: none
 import express, { type Express, type Request, type Response } from 'express';
 import { createServer, type Server } from 'node:http';
 
+import { createSettingsRouter, EMBEDDED_SETTINGS_PAGE_PATH } from './routes/settings.routes';
+import { createSyncRouter } from './routes/sync.routes';
+
 const DEFAULT_PORT = 3000;
 
 export function createApp(): Express {
   const app = express();
 
   app.use(express.json());
+  app.use('/api/settings', createSettingsRouter());
+  app.use('/api/sync', createSyncRouter());
 
   app.get('/health', (_request: Request, response: Response) => {
     response.status(200).json({
       service: 'b24-calendar-backend',
       status: 'ok',
     });
+  });
+
+  app.get(EMBEDDED_SETTINGS_PAGE_PATH, (_request: Request, response: Response) => {
+    response.status(200).type('html').send(`<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>B24 Calendar Settings</title>
+  </head>
+  <body>
+    <main>
+      <h1>B24 Calendar settings</h1>
+      <p>Embedded settings UI is not wired yet. Complete configuration is still pending.</p>
+    </main>
+  </body>
+</html>`);
   });
 
   return app;
