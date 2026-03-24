@@ -1,10 +1,11 @@
 /*
 Module: sync.routes
-Role: Exposes stable placeholder HTTP endpoints for sync status inspection and sync triggering.
+Role: Exposes sync status inspection, manual resync, and Yandex polling triggers.
 Source of Truth: backend/src/routes/sync.routes.ts
 
 Uses:
   express:Router: true
+  ../services/sync.service.ts:SyncService: true
 
 Used by:
   ../index.ts:createApp: true
@@ -14,29 +15,32 @@ Glossary: none
 
 import { Router, type Request, type Response } from 'express';
 
-const SYNC_NOT_READY_MESSAGE = 'Calendar sync configuration is not finished yet. This endpoint is a deterministic placeholder.';
+import { SyncService } from '../services/sync.service';
 
-function buildSyncPlaceholderResponse() {
-  return {
-    lastRunAt: null,
-    message: SYNC_NOT_READY_MESSAGE,
-    ready: false,
-    status: 'not_configured' as const,
-  };
-}
-
-export function createSyncRouter(): Router {
+export function createSyncRouter(syncService: SyncService): Router {
   const router = Router();
 
   router.get('/status', (_request: Request, response: Response) => {
-    response.status(200).json(buildSyncPlaceholderResponse());
+    const status = syncService.getStatus();
+    response.status(200).json({
+      status,
+      reviewerEvidence: status.reviewerEvidence,
+    });
   });
 
-  router.post('/run', (_request: Request, response: Response) => {
-    response.status(501).json({
-      ...buildSyncPlaceholderResponse(),
-      queued: false,
-    });
+  router.post('/run', async (_request: Request, response: Response, next) => {
+    try {
+      const result = await syncService.runManualResync();
+      response.status(200).json({
+        error: null,
+        noop: result.noop,
+        queued: false,
+        result,
+        reviewerEvidence: result.status.reviewerEvidence,
+      });
+    } catch (error: unknown) {
+      next(error);
+    }
   });
 
   return router;
