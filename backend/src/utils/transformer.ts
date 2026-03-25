@@ -251,6 +251,31 @@ function decodeIcsValue(value: string | null): string | null {
   return value.replace(/\\n/gi, '\n').replace(/\\,/g, ',').replace(/\\;/g, ';').replace(/\\\\/g, '\\');
 }
 
+function normalizeIcsPartstat(value: string | null | undefined): string | null {
+  const normalized = normalizeText(value)?.toUpperCase() ?? null;
+  if (!normalized) {
+    return null;
+  }
+
+  if (normalized === 'H' || normalized === 'Y' || normalized === 'ACCEPTED') {
+    return 'ACCEPTED';
+  }
+
+  if (normalized === 'Q' || normalized === 'NEEDS-ACTION') {
+    return 'NEEDS-ACTION';
+  }
+
+  if (normalized === 'N' || normalized === 'DECLINED') {
+    return 'DECLINED';
+  }
+
+  if (normalized === 'TENTATIVE') {
+    return 'TENTATIVE';
+  }
+
+  return null;
+}
+
 function formatDateForIcs(date: string, allDay: boolean): string {
   const parsed = new Date(date);
 
@@ -917,10 +942,11 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
       continue;
     }
 
+    const partstat = normalizeIcsPartstat(attendee.partstat);
     const params = [
       attendee.name ? `CN=${escapeIcsValue(attendee.name)}` : null,
       attendee.role ? `ROLE=${escapeIcsValue(attendee.role)}` : null,
-      attendee.partstat ? `PARTSTAT=${escapeIcsValue(attendee.partstat)}` : null,
+      partstat ? `PARTSTAT=${escapeIcsValue(partstat)}` : null,
     ].filter((item): item is string => Boolean(item));
     const prefix = params.length > 0 ? `;${params.join(';')}` : '';
     lines.push(`ATTENDEE${prefix}:mailto:${escapeIcsValue(attendee.email)}`);

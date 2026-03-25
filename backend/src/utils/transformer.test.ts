@@ -159,6 +159,34 @@ test('transformer appends attendee fallback line when email is missing', () => {
   assert.equal(draft.description, 'Базовое описание\nУчастник: Без почты');
 });
 
+test('transformer maps Bitrix attendee statuses to valid ICS PARTSTAT values', () => {
+  const event = buildBitrixEventFromRaw({
+    ATTENDEE_LIST: [
+      { EMAIL: 'host@example.com', NAME: 'Host', status: 'H' },
+      { EMAIL: 'accepted@example.com', NAME: 'Accepted', status: 'Y' },
+      { EMAIL: 'invited@example.com', NAME: 'Invited', status: 'Q' },
+      { EMAIL: 'declined@example.com', NAME: 'Declined', status: 'N' },
+    ],
+    DATE_FROM: '2026-03-27T10:00:00Z',
+    DATE_TO: '2026-03-27T11:00:00Z',
+    ID: 'attendee-status-map',
+    NAME: 'Status map',
+    SECT_ID: 'calendar-1',
+  });
+
+  const parsed = parseYandexCalendarObject(buildIcsEvent(transformBitrixEventToYandexDraft(event)), 'https://caldav.yandex.ru/status-map.ics', 'etag-status-map');
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) {
+    return;
+  }
+
+  const map = new Map(parsed.value.attendees.map((attendee) => [attendee.email, attendee.partstat]));
+  assert.equal(map.get('host@example.com'), 'ACCEPTED');
+  assert.equal(map.get('accepted@example.com'), 'ACCEPTED');
+  assert.equal(map.get('invited@example.com'), 'NEEDS-ACTION');
+  assert.equal(map.get('declined@example.com'), 'DECLINED');
+});
+
 test('transformer round-trips extended fields and all-day semantics through ICS', () => {
   const bitrixEvent = buildBitrixEventFromRaw({
     ATTENDEES: [{ EMAIL: 'guest@example.com', NAME: 'Guest', STATUS: 'ACCEPTED' }],

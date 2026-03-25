@@ -309,30 +309,12 @@ export class BitrixService {
     }
 
     try {
-      const users = await this.call<unknown[]>(connectionId, 'user.get', {
-        FILTER: {
+      const batchUsers = await this.call<unknown[]>(connectionId, 'user.get', {
+        filter: {
           ID: missing,
         },
       });
-      for (const item of Array.isArray(users) ? users : []) {
-        const payload = typeof item === 'object' && item ? item as Record<string, unknown> : {};
-        const id = payload.ID == null ? '' : String(payload.ID);
-        if (!id) {
-          continue;
-        }
-
-        const email = payload.EMAIL == null ? null : String(payload.EMAIL).trim();
-        const firstName = payload.NAME == null ? '' : String(payload.NAME).trim();
-        const lastName = payload.LAST_NAME == null ? '' : String(payload.LAST_NAME).trim();
-        const name = `${firstName} ${lastName}`.trim() || firstName || lastName || null;
-        values.set(id, {
-          email: email && email.length > 0 ? email : null,
-          name,
-          partstat: null,
-          raw: JSON.stringify(payload),
-          role: 'REQ-PARTICIPANT',
-        });
-      }
+      this.addUsersToDirectory(values, batchUsers);
     } catch (error: unknown) {
       syncDebug({
         connectionId,
@@ -341,11 +323,47 @@ export class BitrixService {
       });
     }
 
+    const unresolved = missing.filter((id) => !values.has(id));
+    for (const id of unresolved) {
+      try {
+        const singleUser = await this.call<unknown[]>(connectionId, 'user.get', {
+          filter: {
+            ID: id,
+          },
+        });
+        this.addUsersToDirectory(values, singleUser);
+      } catch {
+        continue;
+      }
+    }
+
     this.userDirectoryCache.set(connectionId, {
       expiresAt: now + BitrixService.USER_CACHE_TTL_MS,
       values,
     });
     return values;
+  }
+
+  private addUsersToDirectory(target: Map<string, EventAttendee>, source: unknown[]): void {
+    for (const item of Array.isArray(source) ? source : []) {
+      const payload = typeof item === 'object' && item ? item as Record<string, unknown> : {};
+      const id = payload.ID == null ? '' : String(payload.ID);
+      if (!id) {
+        continue;
+      }
+
+      const email = payload.EMAIL == null ? null : String(payload.EMAIL).trim();
+      const firstName = payload.NAME == null ? '' : String(payload.NAME).trim();
+      const lastName = payload.LAST_NAME == null ? '' : String(payload.LAST_NAME).trim();
+      const name = `${firstName} ${lastName}`.trim() || firstName || lastName || null;
+      target.set(id, {
+        email: email && email.length > 0 ? email : null,
+        name,
+        partstat: null,
+        raw: JSON.stringify(payload),
+        role: 'REQ-PARTICIPANT',
+      });
+    }
   }
 
   private async getResourceNameMap(connectionId: string): Promise<Map<string, string>> {
