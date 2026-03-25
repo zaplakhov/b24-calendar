@@ -671,9 +671,8 @@ test('sync service debug trace reports recurring expected skip and cursor diagno
   try {
     const sqliteService = new SQLiteService(temp.dbPath);
     const { connection } = setupReadyConnection(sqliteService);
-    const today = new Date();
-    const startsAt = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 10, 0, 0)).toISOString();
-    const endsAt = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 11, 0, 0)).toISOString();
+    const startsAt = '2026-03-27T10:00:00.000Z';
+    const endsAt = '2026-03-27T11:00:00.000Z';
     const syncService = new SyncService(
       sqliteService,
       {
@@ -686,7 +685,7 @@ test('sync service debug trace reports recurring expected skip and cursor diagno
       } as never,
     );
 
-    const result = await syncService.runManualSyncNow(connection.id);
+    const result = await syncService.runManualSyncNow(connection.id, { baselineDate: '2026-03-27' });
     const debugTrace = syncService.getDebugTrace(connection.id);
 
     assert.equal(result.ok, true);
@@ -695,6 +694,8 @@ test('sync service debug trace reports recurring expected skip and cursor diagno
     assert.equal(debugTrace.trace?.cursorDiagnostics.bitrix.before, null);
     assert.match(String(debugTrace.trace?.cursorDiagnostics.bitrix.after), /T/);
     assert.ok((debugTrace.trace?.trail ?? []).some((item) => item.decision?.reason === 'recurrence_unsupported'));
+    assert.equal(debugTrace.trace?.baseline.mode, 'fixed_day_utc');
+    assert.equal(debugTrace.trace?.baseline.startsAtGteUtc, '2026-03-27T00:00:00.000Z');
   } finally {
     temp.cleanup();
   }
@@ -752,9 +753,8 @@ test('recurring expected skip does not populate last error message', async () =>
   try {
     const sqliteService = new SQLiteService(temp.dbPath);
     const { connection } = setupReadyConnection(sqliteService);
-    const today = new Date();
-    const startsAt = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 12, 0, 0)).toISOString();
-    const endsAt = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 13, 0, 0)).toISOString();
+    const startsAt = '2026-03-27T12:00:00.000Z';
+    const endsAt = '2026-03-27T13:00:00.000Z';
     const syncService = new SyncService(
       sqliteService,
       {
@@ -765,13 +765,41 @@ test('recurring expected skip does not populate last error message', async () =>
       } as never,
     );
 
-    const result = await syncService.runManualSyncNow(connection.id);
+    const result = await syncService.runManualSyncNow(connection.id, { baselineDate: '2026-03-27' });
     const state = sqliteService.getSyncState(connection.id);
 
     assert.equal(result.ok, true);
     assert.equal(state.lastErrorMessage, null);
     assert.equal(state.status, 'success');
     assert.equal(state.lastSkippedRecurringEvents, 1);
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test('manual sync uses explicit baseline date for debug trace window', async () => {
+  const temp = makeTempDbPath('manual-baseline-date');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const { connection } = setupReadyConnection(sqliteService);
+    const syncService = new SyncService(
+      sqliteService,
+      {
+        deleteEvent: async () => undefined,
+        listEventsSince: async () => [createBitrixEvent({ id: 'baseline-event', startsAt: '2026-03-27T10:00:00.000Z', endsAt: '2026-03-27T11:00:00.000Z' })],
+      } as never,
+      {
+        createEvent: async () => createYandexEvent({ uid: 'uid-baseline', url: 'https://caldav.yandex.ru/calendars/user/default/baseline.ics' }),
+        listEventResults: async () => [],
+      } as never,
+    );
+
+    const result = await syncService.runManualSyncNow(connection.id, { baselineDate: '2026-03-27' });
+    const debugTrace = syncService.getDebugTrace(connection.id);
+
+    assert.equal(result.ok, true);
+    assert.equal(debugTrace.trace?.baseline.mode, 'fixed_day_utc');
+    assert.equal(debugTrace.trace?.baseline.startsAtGteUtc, '2026-03-27T00:00:00.000Z');
   } finally {
     temp.cleanup();
   }

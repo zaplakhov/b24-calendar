@@ -111,7 +111,7 @@ docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calen
 - `GET /api/onboarding/:token/bitrix/calendars` -> загрузить календари Bitrix24
 - `GET /api/onboarding/:token/yandex/calendars` -> загрузить календари Яндекс
 - `GET /api/onboarding/:token/sync/status` -> статус sync
-- `POST /api/onboarding/:token/sync/run` -> ручной sync-now по новым изменениям
+- `POST /api/onboarding/:token/sync/run` -> ручной sync-now по новым изменениям (опционально body: `{ "targetDate": "YYYY-MM-DD" }` для детерминированного debug baseline)
 - `GET /api/onboarding/:token/sync/debug-trace` -> полный debug trace последнего/текущего run (token-scoped)
 
 ### Runtime
@@ -143,6 +143,7 @@ docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calen
 4. На `/onboarding/:token` загрузите календари Bitrix24 и Яндекс.
 5. Сохраните настройки и включите sync.
 6. Запустите `POST /api/onboarding/:token/sync/run` или кнопку `Синхронизировать сейчас`.
+   - Для probe BUG-003 используйте body `{ "targetDate": "2026-03-27" }`.
 7. Проверьте, что статусы и reviewer evidence обновляются.
 
 ## Automated verification
@@ -165,7 +166,7 @@ docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calen
 - Endpoint: `GET /api/onboarding/:token/sync/debug-trace`
 - Возвращает диагностику последнего run в формате:
   - `runMeta` (trigger, startedAt, finishedAt, status)
-  - `baseline` (`today+ UTC` фильтр только для диагностического trail)
+- `baseline` (`today_plus_utc` по умолчанию, либо `fixed_day_utc` при `targetDate`; фильтр только для диагностического trail)
   - `inventory` (Bitrix/Yandex события в audit scope)
   - `trail` (per-event цепочка: decision/mutation/mapping/parity/cursor)
   - `cursorDiagnostics` (before/after + note)

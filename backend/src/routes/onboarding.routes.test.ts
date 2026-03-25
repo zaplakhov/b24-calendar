@@ -261,3 +261,99 @@ test('onboarding debug trace endpoint is token-scoped and returns payload contra
     temp.cleanup();
   }
 });
+
+test('onboarding sync run forwards valid targetDate as baselineDate', async () => {
+  const temp = makeTempDbPath('onboarding-target-date-forward');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const connection = setupReadyConnection(sqliteService);
+    const runCalls: Array<{ connectionId: string; options?: { baselineDate?: string } }> = [];
+    const app = express();
+    app.use(express.json());
+    app.use('/api/onboarding', createOnboardingRouter({
+      bitrixService: { fetchCalendars: async () => [] } as never,
+      sqliteService,
+      syncService: {
+        getStatus: () => ({ configured: true, reviewerEvidence: createReviewerEvidenceStub(), state: sqliteService.getSyncState(connection.id) }),
+        requestImmediateSync: () => undefined,
+        runManualSyncNow: async (connectionId: string, options?: { baselineDate?: string }) => {
+          runCalls.push({ connectionId, options });
+          return {
+            noop: false,
+            ok: true,
+            preflight: { allowed: true, message: 'ok', reason: 'ready' as const },
+            processedBitrixEvents: 0,
+            processedYandexEvents: 0,
+            skippedRecurringEvents: 0,
+            status: { reviewerEvidence: createReviewerEvidenceStub() },
+          };
+        },
+      } as never,
+      yandexService: { fetchCalendars: async () => [] } as never,
+    }));
+
+    await withServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/onboarding/${connection.onboardingToken}/sync/run`, {
+        body: JSON.stringify({ targetDate: '2026-03-27' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      });
+
+      assert.equal(response.status, 200);
+    });
+
+    assert.equal(runCalls.length, 1);
+    assert.equal(runCalls[0]?.connectionId, connection.id);
+    assert.deepEqual(runCalls[0]?.options, { baselineDate: '2026-03-27' });
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test('onboarding sync run rejects invalid targetDate with 400', async () => {
+  const temp = makeTempDbPath('onboarding-target-date-invalid');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const connection = setupReadyConnection(sqliteService);
+    let runCalled = false;
+    const app = express();
+    app.use(express.json());
+    app.use('/api/onboarding', createOnboardingRouter({
+      bitrixService: { fetchCalendars: async () => [] } as never,
+      sqliteService,
+      syncService: {
+        getStatus: () => ({ configured: true, reviewerEvidence: createReviewerEvidenceStub(), state: sqliteService.getSyncState(connection.id) }),
+        requestImmediateSync: () => undefined,
+        runManualSyncNow: async () => {
+          runCalled = true;
+          return {
+            noop: false,
+            ok: true,
+            preflight: { allowed: true, message: 'ok', reason: 'ready' as const },
+            processedBitrixEvents: 0,
+            processedYandexEvents: 0,
+            skippedRecurringEvents: 0,
+            status: { reviewerEvidence: createReviewerEvidenceStub() },
+          };
+        },
+      } as never,
+      yandexService: { fetchCalendars: async () => [] } as never,
+    }));
+
+    await withServer(app, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/onboarding/${connection.onboardingToken}/sync/run`, {
+        body: JSON.stringify({ targetDate: '2026-13-99' }),
+        headers: { 'content-type': 'application/json' },
+        method: 'POST',
+      });
+      const payload = await response.json() as { error?: string };
+
+      assert.equal(response.status, 400);
+      assert.equal(payload.error, 'targetDate must be YYYY-MM-DD');
+    });
+
+    assert.equal(runCalled, false);
+  } finally {
+    temp.cleanup();
+  }
+});
