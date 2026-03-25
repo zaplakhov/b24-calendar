@@ -206,7 +206,9 @@ test('transformer emits METHOD:REQUEST and VALARM entries for attendees and remi
 
   const ics = buildIcsEvent(transformBitrixEventToYandexDraft(event));
   assert.match(ics, /METHOD:REQUEST/);
-  assert.match(ics, /ATTENDEE;CN=Guest;CUTYPE=INDIVIDUAL;RSVP=TRUE;SCHEDULE-AGENT=CLIENT;PARTSTAT=ACCEPTED:mailto:guest@example.com/);
+  assert.match(ics, /ATTENDEE;CN="Guest";CUTYPE=INDIVIDUAL/);
+  assert.match(ics, /SCHEDULE-AGENT=CLIENT/);
+  assert.match(ics, /mailto:guest@example.com/);
   assert.match(ics, /BEGIN:VALARM/);
   assert.match(ics, /TRIGGER:-PT15M/);
   assert.match(ics, /TRIGGER:-PT60M/);
@@ -217,7 +219,26 @@ test('transformer emits METHOD:REQUEST and VALARM entries for attendees and remi
     return;
   }
 
+  assert.equal(parsed.value.attendees[0]?.email, 'guest@example.com');
+  assert.equal(parsed.value.attendees[0]?.partstat, 'ACCEPTED');
   assert.deepEqual(parsed.value.reminders, [{ minutes: 15 }, { minutes: 60 }]);
+});
+
+test('transformer folds long ICS lines with RFC continuation', () => {
+  const draft = transformBitrixEventToYandexDraft(buildBitrixEventFromRaw({
+    ATTENDEE_LIST: [{ EMAIL: 'long@example.com', NAME: 'Очень Длинное Имя Участника Для Проверки Переноса Строк', status: 'Q' }],
+    DATE_FROM: '27.03.2026 14:45:00',
+    DATE_TO: '27.03.2026 15:45:00',
+    ID: 'ics-fold-check',
+    NAME: 'Fold check',
+    SECT_ID: 'calendar-1',
+    TZ_FROM: 'Europe/Moscow',
+  }));
+
+  const ics = buildIcsEvent(draft);
+  assert.match(ics, /\r\n /);
+  const parsed = parseYandexCalendarObject(ics, 'https://caldav.yandex.ru/fold-check.ics', 'etag-fold-check');
+  assert.equal(parsed.ok, true);
 });
 
 test('transformer round-trips extended fields and all-day semantics through ICS', () => {

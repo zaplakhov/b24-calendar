@@ -251,6 +251,40 @@ function escapeIcsValue(value: string): string {
     .replace(/;/g, '\\;');
 }
 
+function escapeIcsParamValue(value: string): string {
+  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ');
+  return `"${escaped}"`;
+}
+
+function foldIcsLine(line: string, maxOctets = 75): string[] {
+  if (Buffer.byteLength(line, 'utf8') <= maxOctets) {
+    return [line];
+  }
+
+  const chunks: string[] = [];
+  let current = '';
+  for (const char of line) {
+    const candidate = `${current}${char}`;
+    if (Buffer.byteLength(candidate, 'utf8') > maxOctets && current.length > 0) {
+      chunks.push(current);
+      current = char;
+      continue;
+    }
+
+    current = candidate;
+  }
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
+  return chunks.map((chunk, index) => (index === 0 ? chunk : ` ${chunk}`));
+}
+
+function foldIcsLines(lines: string[]): string[] {
+  return lines.flatMap((line) => foldIcsLine(line));
+}
+
 function decodeIcsValue(value: string | null): string | null {
   if (!value) {
     return null;
@@ -1033,7 +1067,7 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
   }
 
   if (draft.organizer?.email || draft.organizer?.name) {
-    const cn = draft.organizer.name ? `;CN=${escapeIcsValue(draft.organizer.name)}` : '';
+    const cn = draft.organizer.name ? `;CN=${escapeIcsParamValue(draft.organizer.name)}` : '';
     lines.push(`ORGANIZER${cn}:mailto:${escapeIcsValue(draft.organizer.email ?? 'unknown@example.invalid')}`);
   }
 
@@ -1044,7 +1078,7 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
 
     const partstat = normalizeIcsPartstat(attendee.partstat);
     const params = [
-      attendee.name ? `CN=${escapeIcsValue(attendee.name)}` : null,
+      attendee.name ? `CN=${escapeIcsParamValue(attendee.name)}` : null,
       'CUTYPE=INDIVIDUAL',
       attendee.role ? `ROLE=${escapeIcsValue(attendee.role)}` : null,
       'RSVP=TRUE',
@@ -1076,7 +1110,7 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
   }
 
   lines.push('END:VEVENT', 'END:VCALENDAR');
-  return `${lines.join('\r\n')}\r\n`;
+  return `${foldIcsLines(lines).join('\r\n')}\r\n`;
 }
 
 export function parseYandexCalendarObject(rawIcs: string, url: string, etag: string | null): NormalizationResult<YandexCalendarEvent> {
