@@ -17,7 +17,7 @@ Glossary: none
 
 import { BitrixAuthService } from './bitrix-auth.service';
 import { SQLiteService, type PersistedCalendar } from './sqlite.service';
-import { buildBitrixEventFromRaw, type BitrixCalendarDraft, type BitrixCalendarEvent } from '../utils/transformer';
+import { buildBitrixEventFromRaw, type BitrixCalendarDraft, type BitrixCalendarEvent, type EventAttendee } from '../utils/transformer';
 import { syncDebug, syncVerbose } from '../utils/sync-debug';
 
 interface BitrixResponseEnvelope<T> {
@@ -69,8 +69,10 @@ function buildFallbackBitrixEvent(eventId: string, draft: BitrixCalendarDraft, c
 export class BitrixService {
   private static readonly RATE_LIMIT_MAX_RETRIES = 4;
   private static readonly RESOURCE_CACHE_TTL_MS = 5 * 60 * 1000;
+  private static readonly USER_CACHE_TTL_MS = 5 * 60 * 1000;
 
   private readonly resourceNameCache = new Map<string, { expiresAt: number; values: Map<string, string> }>();
+  private readonly userDirectoryCache = new Map<string, { expiresAt: number; values: Map<string, EventAttendee> }>();
 
   public constructor(
     private readonly sqliteService: SQLiteService,
@@ -178,8 +180,19 @@ export class BitrixService {
     });
 
     const mappedEvents = (Array.isArray(result) ? result : []).map((item) => buildBitrixEventFromRaw((item ?? {}) as BitrixPayload));
-    await this.enrichResourceLocations(connectionId, mappedEvents);
+    await this.enrichEventMetadata(connectionId, mappedEvents);
     return mappedEvents;
+  }
+
+  private async enrichEventMetadata(connectionId: string, events: BitrixCalendarEvent[]): Promise<void> {
+    if (events.length === 0) {
+      return;
+    }
+
+    await Promise.all([
+      this.enrichResourceLocations(connectionId, events),
+      this.enrichEventAttendees(connectionId, events),
+    ]);
   }
 
   private async enrichResourceLocations(connectionId: string, events: BitrixCalendarEvent[]): Promise<void> {
@@ -205,8 +218,134 @@ export class BitrixService {
       const resourceName = resourceMap.get(locationMatch[1]);
       if (resourceName) {
         event.location = resourceName;
+      } else if (/^calendar_3_\d+$/i.test(location)) {
+        event.location = 'Видеозвонок Б24';
       }
     }
+  }
+
+  private async enrichEventAttendees(connectionId: string, events: BitrixCalendarEvent[]): Promise<void> {
+    const attendeeIds = new Set<string>();
+    for (const event of events) {
+      for (const attendee of this.extractRawAttendees(event.raw)) {
+        attendeeIds.add(attendee);
+      }
+    }
+
+    if (attendeeIds.size === 0) {
+      return;
+    }
+
+    const userDirectory = await this.getUserDirectory(connectionId, [...attendeeIds]);
+    for (const event of events) {
+      const merged = new Map<string, EventAttendee>();
+      for (const attendee of event.attendees) {
+        const key = attendee.email ?? `${attendee.name ?? ''}|${attendee.partstat ?? ''}|${attendee.role ?? ''}`;
+        merged.set(key, attendee);
+      }
+
+      for (const id of this.extractRawAttendees(event.raw)) {
+        const resolved = userDirectory.get(id);
+        if (!resolved) {
+          continue;
+        }
+
+        const key = resolved.email ?? `${resolved.name ?? ''}|${resolved.partstat ?? ''}|${resolved.role ?? ''}`;
+        if (!merged.has(key)) {
+          merged.set(key, {
+            ...resolved,
+            partstat: this.resolveAttendeeStatusFromRaw(event.raw, id) ?? resolved.partstat,
+          });
+        }
+      }
+
+      event.attendees = [...merged.values()];
+    }
+  }
+
+  private extractRawAttendees(raw: Record<string, unknown>): string[] {
+    const ids = new Set<string>();
+    const attendeeList = Array.isArray(raw.ATTENDEE_LIST) ? raw.ATTENDEE_LIST : [];
+    for (const item of attendeeList) {
+      const payload = typeof item === 'object' && item ? item as Record<string, unknown> : null;
+      const id = payload?.id == null ? null : String(payload.id);
+      if (id) {
+        ids.add(id);
+      }
+    }
+
+    const entities = Array.isArray(raw.attendeesEntityList) ? raw.attendeesEntityList : [];
+    for (const entity of entities) {
+      const payload = typeof entity === 'object' && entity ? entity as Record<string, unknown> : null;
+      const entityType = payload?.entityId == null ? null : String(payload.entityId).toLowerCase();
+      const id = payload?.id == null ? null : String(payload.id);
+      if (entityType === 'user' && id) {
+        ids.add(id);
+      }
+    }
+
+    return [...ids];
+  }
+
+  private resolveAttendeeStatusFromRaw(raw: Record<string, unknown>, attendeeId: string): string | null {
+    const attendeeList = Array.isArray(raw.ATTENDEE_LIST) ? raw.ATTENDEE_LIST : [];
+    const match = attendeeList.find((item) => {
+      const payload = typeof item === 'object' && item ? item as Record<string, unknown> : null;
+      return payload?.id != null && String(payload.id) === attendeeId;
+    });
+    const status = match && typeof (match as Record<string, unknown>).status === 'string'
+      ? String((match as Record<string, unknown>).status).trim().toUpperCase()
+      : null;
+    return status && status.length > 0 ? status : null;
+  }
+
+  private async getUserDirectory(connectionId: string, ids: string[]): Promise<Map<string, EventAttendee>> {
+    const now = Date.now();
+    const cached = this.userDirectoryCache.get(connectionId);
+    const values = cached && cached.expiresAt > now ? new Map(cached.values) : new Map<string, EventAttendee>();
+    const missing = ids.filter((id) => !values.has(id));
+    if (missing.length === 0) {
+      return values;
+    }
+
+    try {
+      const users = await this.call<unknown[]>(connectionId, 'user.get', {
+        FILTER: {
+          ID: missing,
+        },
+      });
+      for (const item of Array.isArray(users) ? users : []) {
+        const payload = typeof item === 'object' && item ? item as Record<string, unknown> : {};
+        const id = payload.ID == null ? '' : String(payload.ID);
+        if (!id) {
+          continue;
+        }
+
+        const email = payload.EMAIL == null ? null : String(payload.EMAIL).trim();
+        const firstName = payload.NAME == null ? '' : String(payload.NAME).trim();
+        const lastName = payload.LAST_NAME == null ? '' : String(payload.LAST_NAME).trim();
+        const name = `${firstName} ${lastName}`.trim() || firstName || lastName || null;
+        values.set(id, {
+          email: email && email.length > 0 ? email : null,
+          name,
+          partstat: null,
+          raw: JSON.stringify(payload),
+          role: 'REQ-PARTICIPANT',
+        });
+      }
+    } catch (error: unknown) {
+      syncDebug({
+        connectionId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        phase: 'bitrix.user.get.fallback',
+      });
+    }
+
+    this.userDirectoryCache.set(connectionId, {
+      expiresAt: now + BitrixService.USER_CACHE_TTL_MS,
+      values,
+    });
+    return values;
   }
 
   private async getResourceNameMap(connectionId: string): Promise<Map<string, string>> {
@@ -266,10 +405,18 @@ export class BitrixService {
     }
 
     if (Array.isArray(result)) {
-       return result.length > 0 ? buildBitrixEventFromRaw((result[0] ?? {}) as BitrixPayload) : null;
+      if (result.length === 0) {
+        return null;
+      }
+
+      const event = buildBitrixEventFromRaw((result[0] ?? {}) as BitrixPayload);
+      await this.enrichEventMetadata(connectionId, [event]);
+      return event;
     }
 
-    return buildBitrixEventFromRaw(result as BitrixPayload);
+    const event = buildBitrixEventFromRaw(result as BitrixPayload);
+    await this.enrichEventMetadata(connectionId, [event]);
+    return event;
   }
 
   public async createEvent(connectionId: string, draft: BitrixCalendarDraft): Promise<BitrixCalendarEvent> {
