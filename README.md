@@ -112,6 +112,7 @@ docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calen
 - `GET /api/onboarding/:token/yandex/calendars` -> загрузить календари Яндекс
 - `GET /api/onboarding/:token/sync/status` -> статус sync
 - `POST /api/onboarding/:token/sync/run` -> ручной sync-now по новым изменениям
+- `GET /api/onboarding/:token/sync/debug-trace` -> полный debug trace последнего/текущего run (token-scoped)
 
 ### Runtime
 
@@ -158,3 +159,21 @@ docker run --rm -p 3000:3000 -v "$PWD/.data:/data" --name b24-calendar b24-calen
 - После первого включения `syncEnabled` сервис сразу запускает initial sync для connection.
 - Кнопка `Синхронизировать сейчас` запускает тот же incremental pipeline немедленно и не должна выполнять отдельную полную пересборку календаря.
 - Bitrix webhook остается дополнительным ускорителем, но больше не является обязательным условием для работы Bitrix -> Yandex.
+
+## Debug trace контракт
+
+- Endpoint: `GET /api/onboarding/:token/sync/debug-trace`
+- Возвращает диагностику последнего run в формате:
+  - `runMeta` (trigger, startedAt, finishedAt, status)
+  - `baseline` (`today+ UTC` фильтр только для диагностического trail)
+  - `inventory` (Bitrix/Yandex события в audit scope)
+  - `trail` (per-event цепочка: decision/mutation/mapping/parity/cursor)
+  - `cursorDiagnostics` (before/after + note)
+  - `summary` (reason buckets, soft failures, expected recurring skips)
+  - `markers` + `truncated` (усечения/редакции payload)
+
+### Guardrails
+
+- Секреты (`*password*`, `*token*`, `*secret*`, `*auth*`, `*credential*`) редактируются в `***redacted***`.
+- Большие массивы/строки усекаются детерминированно; факты усечения отражаются в `markers`.
+- Recurring events в текущем baseline считаются expected skip (`recurrence_unsupported`).

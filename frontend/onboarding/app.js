@@ -5,6 +5,7 @@ const state = {
     bitrix: [],
     yandex: [],
   },
+  debugTrace: null,
 };
 
 const settingsForm = document.getElementById('settingsForm');
@@ -20,6 +21,26 @@ const lastErrorValue = document.getElementById('lastErrorValue');
 const portalValue = document.getElementById('portalValue');
 const bitrixUserValue = document.getElementById('bitrixUserValue');
 const portalCaption = document.getElementById('portalCaption');
+let diagnosticsSummary = null;
+let diagnosticsRaw = null;
+
+function ensureDiagnosticsPanel() {
+  if (diagnosticsSummary && diagnosticsRaw) {
+    return;
+  }
+
+  const grid = document.querySelector('.grid--secondary');
+  if (!grid) {
+    return;
+  }
+
+  const section = document.createElement('section');
+  section.className = 'card status-card';
+  section.innerHTML = '<h2>Sync diagnostics (debug trace)</h2><pre id="diagnosticsSummary">Диагностика еще не загружена.</pre><pre id="diagnosticsRaw">{}</pre>';
+  grid.appendChild(section);
+  diagnosticsSummary = section.querySelector('#diagnosticsSummary');
+  diagnosticsRaw = section.querySelector('#diagnosticsRaw');
+}
 
 const fields = {
   bitrixCalendarId: document.getElementById('bitrixCalendarId'),
@@ -100,6 +121,75 @@ function fillSettings(response) {
   setBanner('Подключите Яндекс Календарь, выберите календари и сохраните настройки.');
 }
 
+function maskSecrets(value, parentKey = '') {
+  const secretKeyPattern = /(password|token|secret|credential|authorization|auth|cookie|session)/i;
+  if (Array.isArray(value)) {
+    return value.map((item) => maskSecrets(item, parentKey));
+  }
+
+  if (value && typeof value === 'object') {
+    const masked = {};
+    for (const [key, nested] of Object.entries(value)) {
+      if (secretKeyPattern.test(key)) {
+        masked[key] = '***redacted***';
+      } else {
+        masked[key] = maskSecrets(nested, key);
+      }
+    }
+    return masked;
+  }
+
+  if (typeof value === 'string' && secretKeyPattern.test(parentKey)) {
+    return value ? '***redacted***' : '';
+  }
+
+  return value;
+}
+
+function renderDebugTrace(debugTrace) {
+  ensureDiagnosticsPanel();
+  if (!diagnosticsSummary || !diagnosticsRaw) {
+    return;
+  }
+
+  if (!debugTrace?.available || !debugTrace.trace) {
+    diagnosticsSummary.textContent = 'Debug trace пока отсутствует. Запустите sync, чтобы получить диагностический run-level trail.';
+    diagnosticsRaw.textContent = JSON.stringify({ available: false }, null, 2);
+    return;
+  }
+
+  const masked = maskSecrets(debugTrace.trace);
+  const summary = masked.summary || {};
+  diagnosticsSummary.textContent = [
+    `run: ${masked.runMeta?.trigger || '-'} (${masked.runMeta?.status || '-'})`,
+    `trail events (today+): ${summary.trailCount ?? 0}`,
+    `soft failures: ${summary.softFailures ?? 0}`,
+    `expected recurring skips: ${summary.expectedRecurringSkips ?? 0}`,
+    `markers: ${debugTrace.markers?.length || 0}, truncated: ${Boolean(debugTrace.truncated)}`,
+  ].join('\n');
+  diagnosticsRaw.textContent = JSON.stringify({ ...debugTrace, trace: masked }, null, 2);
+
+  console.groupCollapsed('[onboarding][sync-debug] summary');
+  console.table(summary.reasonBuckets || {});
+  console.log(masked.runMeta);
+  console.groupEnd();
+
+  console.groupCollapsed('[onboarding][sync-debug] trail');
+  console.table((masked.trail || []).map((item) => ({
+    decision: item.decision?.reason || '-',
+    direction: item.direction,
+    eventKey: item.eventKey,
+    mutation: item.mutation?.outcome || '-',
+  })));
+  console.groupEnd();
+}
+
+async function loadDebugTrace() {
+  const payload = await fetchJson(endpoint('/sync/debug-trace'));
+  state.debugTrace = payload.debugTrace || null;
+  renderDebugTrace(state.debugTrace);
+}
+
 async function fetchJson(url, options) {
   const response = await fetch(url, {
     headers: {
@@ -121,6 +211,7 @@ async function loadSettings() {
   setBanner('Загрузка настроек...');
   const payload = await fetchJson(endpoint());
   fillSettings(payload);
+  await loadDebugTrace().catch(() => renderDebugTrace(null));
 }
 
 async function persistCurrentSettings() {
@@ -178,6 +269,7 @@ async function triggerSync() {
   });
 
   runtimeStatus.textContent = JSON.stringify(payload.result?.status || payload.status || payload, null, 2);
+  await loadDebugTrace().catch(() => renderDebugTrace(null));
   setBanner('Ручной sync по новым изменениям завершен.', 'success');
 }
 

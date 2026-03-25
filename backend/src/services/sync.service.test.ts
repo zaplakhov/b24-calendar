@@ -665,3 +665,72 @@ test('webhook sync uses incremental-style outcome reason for healing and soft fa
     temp.cleanup();
   }
 });
+
+test('sync service debug trace reports recurring expected skip and cursor diagnostics', async () => {
+  const temp = makeTempDbPath('debug-trace-recurring');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const { connection } = setupReadyConnection(sqliteService);
+    const today = new Date();
+    const startsAt = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 10, 0, 0)).toISOString();
+    const endsAt = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 11, 0, 0)).toISOString();
+    const syncService = new SyncService(
+      sqliteService,
+      {
+        listEventsSince: async () => [createBitrixEvent({ endsAt, startsAt, id: 'bitrix-recurring', recurrenceRule: 'FREQ=DAILY;COUNT=2' })],
+      } as never,
+      {
+        listEventResults: async () => [
+          { ok: true as const, value: createYandexEvent({ endsAt, startsAt, uid: 'yandex-recurring', recurrenceRule: 'FREQ=DAILY;COUNT=2' }) },
+        ],
+      } as never,
+    );
+
+    const result = await syncService.runManualSyncNow(connection.id);
+    const debugTrace = syncService.getDebugTrace(connection.id);
+
+    assert.equal(result.ok, true);
+    assert.equal(debugTrace.available, true);
+    assert.equal(debugTrace.trace?.summary.expectedRecurringSkips, 2);
+    assert.equal(debugTrace.trace?.cursorDiagnostics.bitrix.before, null);
+    assert.match(String(debugTrace.trace?.cursorDiagnostics.bitrix.after), /T/);
+    assert.ok((debugTrace.trace?.trail ?? []).some((item) => item.decision?.reason === 'recurrence_unsupported'));
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test('sync service debug trace applies redaction and truncation markers for payload contract', () => {
+  const temp = makeTempDbPath('debug-trace-redaction-truncation');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const { connection } = setupReadyConnection(sqliteService);
+    const syncService = new SyncService(sqliteService, {} as never, {} as never);
+
+    const oversizedTrail = Array.from({ length: 230 }, (_, index) => ({
+      decision: { reason: 'mapping_missing' },
+      eventKey: `event-${index}`,
+    }));
+
+    sqliteService.updateSyncState(connection.id, {
+      lastDebugTrace: {
+        runMeta: { status: 'success', trigger: 'manual_sync' },
+        secretToken: 'top-secret',
+        summary: { trailCount: oversizedTrail.length },
+        trail: oversizedTrail,
+      },
+    });
+
+    const debugTrace = syncService.getDebugTrace(connection.id);
+    const markers = debugTrace.markers.map((item) => item.reason);
+
+    assert.equal(debugTrace.available, true);
+    assert.equal(debugTrace.truncated, true);
+    assert.ok(markers.includes('redacted'));
+    assert.ok(markers.includes('truncated_array'));
+    assert.equal((debugTrace.trace?.trail as unknown[]).length, 200);
+    assert.equal((debugTrace.trace as { secretToken?: string }).secretToken, '***redacted***');
+  } finally {
+    temp.cleanup();
+  }
+});

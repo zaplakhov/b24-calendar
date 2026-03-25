@@ -40,6 +40,15 @@ interface SettingsResponsePayload {
   };
 }
 
+interface DebugTraceResponsePayload {
+  debugTrace: {
+    available: boolean;
+    markers: Array<{ path: string; reason: string }>;
+    trace: Record<string, unknown> | null;
+    truncated: boolean;
+  };
+}
+
 function makeTempDbPath(name: string): { cleanup: () => void; dbPath: string } {
   const dir = mkdtempSync(join(tmpdir(), `b24-calendar-${name}-`));
   return {
@@ -207,6 +216,46 @@ test('onboarding settings response never leaks saved Yandex password', async () 
       assert.equal(response.status, 200);
       assert.equal(payload.settings.yandexPassword, '');
       assert.equal(payload.credentials.yandexPasswordSaved, true);
+    });
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test('onboarding debug trace endpoint is token-scoped and returns payload contract', async () => {
+  const temp = makeTempDbPath('onboarding-debug-trace');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const connection = setupReadyConnection(sqliteService);
+    const app = express();
+    app.use(express.json());
+    app.use('/api/onboarding', createOnboardingRouter({
+      bitrixService: { fetchCalendars: async () => [] } as never,
+      sqliteService,
+      syncService: {
+        getDebugTrace: () => ({
+          available: true,
+          markers: [{ path: 'trace.inventory[0].auth', reason: 'redacted' }],
+          trace: { runMeta: { status: 'success', trigger: 'manual_sync' }, summary: { trailCount: 1 } },
+          truncated: true,
+        }),
+        getStatus: () => ({ configured: true, reviewerEvidence: createReviewerEvidenceStub(), state: sqliteService.getSyncState(connection.id) }),
+        requestImmediateSync: () => undefined,
+        runManualSyncNow: async () => ({ noop: false, ok: true, preflight: { allowed: true, message: 'ok', reason: 'ready' }, processedBitrixEvents: 0, processedYandexEvents: 0, skippedRecurringEvents: 0, status: { reviewerEvidence: createReviewerEvidenceStub() } }),
+      } as never,
+      yandexService: { fetchCalendars: async () => [] } as never,
+    }));
+
+    await withServer(app, async (baseUrl) => {
+      const okResponse = await fetch(`${baseUrl}/api/onboarding/${connection.onboardingToken}/sync/debug-trace`);
+      const okPayload = await okResponse.json() as DebugTraceResponsePayload;
+      assert.equal(okResponse.status, 200);
+      assert.equal(okPayload.debugTrace.available, true);
+      assert.equal(okPayload.debugTrace.truncated, true);
+      assert.equal(okPayload.debugTrace.markers.length, 1);
+
+      const deniedResponse = await fetch(`${baseUrl}/api/onboarding/invalid-token/sync/debug-trace`);
+      assert.equal(deniedResponse.status, 500);
     });
   } finally {
     temp.cleanup();

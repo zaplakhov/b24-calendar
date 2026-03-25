@@ -199,5 +199,13 @@ export function createOnboardingRouter(dependencies: OnboardingRouterDependencie
     }
   });
 
+  router.get('/:token/sync/debug-trace', (request: Request, response: Response) => {
+    const context = resolveContext(sqliteService, request.params.token);
+    const debugTrace = syncService.getDebugTrace(context.connection.id);
+    response.status(200).json({
+      debugTrace,
+    });
+  });
+
   return router;
 }
