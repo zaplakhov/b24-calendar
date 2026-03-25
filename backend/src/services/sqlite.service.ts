@@ -96,6 +96,7 @@ export interface SyncState {
   lastSkippedRecurringEvents: number;
   lastOutcomeReason: string | null;
   lastRunObservability: SyncRunObservability | null;
+  lastDebugTrace: Record<string, unknown> | null;
 }
 
 export interface SyncRunObservability {
@@ -197,6 +198,7 @@ interface SyncStateRow {
   last_skipped_recurring_events: number | null;
   last_outcome_reason: string | null;
   last_run_observability_json: string | null;
+  last_debug_trace_json: string | null;
 }
 
 interface MappingRow {
@@ -241,6 +243,7 @@ const DEFAULT_SYNC_STATE: SyncState = {
   lastSkippedRecurringEvents: 0,
   lastOutcomeReason: null,
   lastRunObservability: null,
+  lastDebugTrace: null,
 };
 
 function resolveDatabasePath(rawPath = process.env.SQLITE_DB_PATH): string {
@@ -626,7 +629,7 @@ export class SQLiteService {
   public getSyncState(connectionId: string): SyncState {
     this.ensureScopedSyncState(connectionId);
     const row = this.database
-      .prepare<[string], SyncStateRow>('SELECT status, last_run_at, last_success_at, last_error_at, last_error_message, last_webhook_at, last_poll_at, active_direction, bitrix_sync_cursor, yandex_sync_cursor, polling_failure_count, last_processed_bitrix_events, last_processed_yandex_events, last_skipped_recurring_events, last_outcome_reason, last_run_observability_json FROM connection_sync_state WHERE connection_id = ?')
+      .prepare<[string], SyncStateRow>('SELECT status, last_run_at, last_success_at, last_error_at, last_error_message, last_webhook_at, last_poll_at, active_direction, bitrix_sync_cursor, yandex_sync_cursor, polling_failure_count, last_processed_bitrix_events, last_processed_yandex_events, last_skipped_recurring_events, last_outcome_reason, last_run_observability_json, last_debug_trace_json FROM connection_sync_state WHERE connection_id = ?')
       .get(connectionId);
 
     if (!row) {
@@ -650,6 +653,7 @@ export class SQLiteService {
       lastSkippedRecurringEvents: row.last_skipped_recurring_events ?? 0,
       lastOutcomeReason: row.last_outcome_reason,
       lastRunObservability: parseJsonObject(row.last_run_observability_json) as SyncRunObservability | null,
+      lastDebugTrace: parseJsonObject(row.last_debug_trace_json),
     };
   }
 
@@ -672,13 +676,15 @@ export class SQLiteService {
              polling_failure_count = @pollingFailureCount,
               last_processed_bitrix_events = @lastProcessedBitrixEvents,
               last_processed_yandex_events = @lastProcessedYandexEvents,
-              last_skipped_recurring_events = @lastSkippedRecurringEvents,
-              last_outcome_reason = @lastOutcomeReason,
-              last_run_observability_json = @lastRunObservabilityJson
-       WHERE connection_id = @connectionId`,
+               last_skipped_recurring_events = @lastSkippedRecurringEvents,
+               last_outcome_reason = @lastOutcomeReason,
+               last_run_observability_json = @lastRunObservabilityJson,
+               last_debug_trace_json = @lastDebugTraceJson
+        WHERE connection_id = @connectionId`,
     ).run({
       connectionId,
       ...next,
+      lastDebugTraceJson: next.lastDebugTrace ? JSON.stringify(next.lastDebugTrace) : null,
       lastRunObservabilityJson: next.lastRunObservability ? JSON.stringify(next.lastRunObservability) : null,
     });
 
@@ -817,10 +823,11 @@ export class SQLiteService {
              polling_failure_count = 0,
              last_processed_bitrix_events = 0,
              last_processed_yandex_events = 0,
-             last_skipped_recurring_events = 0,
-             last_outcome_reason = NULL,
-             last_run_observability_json = NULL
-       WHERE connection_id = ?`,
+              last_skipped_recurring_events = 0,
+              last_outcome_reason = NULL,
+              last_run_observability_json = NULL,
+              last_debug_trace_json = NULL
+        WHERE connection_id = ?`,
     ).run(connectionId);
   }
 
@@ -899,6 +906,8 @@ export class SQLiteService {
         last_processed_yandex_events INTEGER NOT NULL DEFAULT 0,
         last_skipped_recurring_events INTEGER NOT NULL DEFAULT 0,
         last_outcome_reason TEXT,
+        last_run_observability_json TEXT,
+        last_debug_trace_json TEXT,
         FOREIGN KEY (connection_id) REFERENCES user_connections(id)
       );
 
@@ -954,6 +963,10 @@ export class SQLiteService {
 
     if (!columns.includes('last_run_observability_json')) {
       this.database.exec('ALTER TABLE connection_sync_state ADD COLUMN last_run_observability_json TEXT');
+    }
+
+    if (!columns.includes('last_debug_trace_json')) {
+      this.database.exec('ALTER TABLE connection_sync_state ADD COLUMN last_debug_trace_json TEXT');
     }
   }
 

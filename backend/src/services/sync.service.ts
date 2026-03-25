@@ -33,7 +33,15 @@ import {
 import { BitrixService } from './bitrix.service';
 import { SQLiteService, type ConnectionSettings, type SyncRunObservability, type SyncState } from './sqlite.service';
 import { YandexCalDavService, YandexCalendarNormalizationError, YandexCalendarObjectNotFoundError } from './yandex-caldav.service';
-import { syncDebug, syncError, syncInfo, syncVerbose, syncWarn } from '../utils/sync-debug';
+import {
+  sanitizeAndTruncateTracePayload,
+  type SyncPayloadMarker,
+  syncDebug,
+  syncError,
+  syncInfo,
+  syncVerbose,
+  syncWarn,
+} from '../utils/sync-debug';
 
 export interface SyncStatusResponse {
   configured: boolean;
@@ -104,6 +112,85 @@ interface EventSyncResult {
   healingReason?: string;
   reason?: string;
   skipped: boolean;
+}
+
+type SyncTrailDirection = 'bitrix_to_yandex' | 'yandex_to_bitrix';
+
+interface SyncTraceCursorSnapshot {
+  after: string | null;
+  before: string | null;
+  note: string | null;
+}
+
+interface SyncTraceItem {
+  baselineIncluded: boolean;
+  cursor: SyncTraceCursorSnapshot;
+  decision: {
+    action: string;
+    explanation: string;
+    reason: string;
+  } | null;
+  direction: SyncTrailDirection;
+  eventKey: string;
+  fieldParity: {
+    appliedFields: string[];
+    deferredReasonCodes: string[];
+    preservedFields: string[];
+  } | null;
+  inventory: {
+    id: string;
+    provider: 'bitrix' | 'yandex';
+    startsAt: string | null;
+    title: string | null;
+    updatedAt: string | null;
+  };
+  mappingDelta: {
+    after: Record<string, unknown> | null;
+    before: Record<string, unknown> | null;
+  } | null;
+  mutation: {
+    errorClass: string | null;
+    executedAction: string;
+    intendedAction: string;
+    outcome: 'error' | 'executed' | 'skipped';
+  } | null;
+}
+
+interface SyncDebugTrace {
+  baseline: {
+    mode: 'today_plus_utc';
+    startsAtGteUtc: string;
+  };
+  cursorDiagnostics: {
+    bitrix: SyncTraceCursorSnapshot;
+    yandex: SyncTraceCursorSnapshot;
+  };
+  inventory: {
+    bitrix: Array<SyncTraceItem['inventory']>;
+    yandex: Array<SyncTraceItem['inventory']>;
+  };
+  runMeta: {
+    connectionId: string;
+    finishedAt: string | null;
+    startedAt: string;
+    status: 'error' | 'noop' | 'running' | 'success';
+    trigger: SyncExecutionPath;
+  };
+  summary: {
+    expectedRecurringSkips: number;
+    reasonBuckets: Record<string, number>;
+    softFailures: number;
+    trailCount: number;
+  };
+  trail: SyncTraceItem[];
+  version: 'v1';
+}
+
+export interface SyncDebugTraceResponse {
+  available: boolean;
+  markers: SyncPayloadMarker[];
+  trace: SyncDebugTrace | null;
+  truncated: boolean;
 }
 
 interface SyncRunObservabilityAccumulator {
@@ -292,6 +379,145 @@ export class SyncService {
     };
   }
 
+  private createDebugTrace(connectionId: string, trigger: SyncExecutionPath, startedAt: string, previousState: SyncState): SyncDebugTrace {
+    const baselineStart = this.getTodayBaselineStartUtc();
+    return {
+      baseline: {
+        mode: 'today_plus_utc',
+        startsAtGteUtc: baselineStart,
+      },
+      cursorDiagnostics: {
+        bitrix: { after: null, before: previousState.bitrixSyncCursor, note: null },
+        yandex: { after: null, before: previousState.yandexSyncCursor, note: null },
+      },
+      inventory: {
+        bitrix: [],
+        yandex: [],
+      },
+      runMeta: {
+        connectionId,
+        finishedAt: null,
+        startedAt,
+        status: 'running',
+        trigger,
+      },
+      summary: {
+        expectedRecurringSkips: 0,
+        reasonBuckets: {},
+        softFailures: 0,
+        trailCount: 0,
+      },
+      trail: [],
+      version: 'v1',
+    };
+  }
+
+  private incrementTraceReason(trace: SyncDebugTrace, reason: string): void {
+    trace.summary.reasonBuckets[reason] = (trace.summary.reasonBuckets[reason] ?? 0) + 1;
+    if (reason === 'recurrence_unsupported') {
+      trace.summary.expectedRecurringSkips += 1;
+    }
+  }
+
+  private getTodayBaselineStartUtc(): string {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+  }
+
+  private isBaselineEvent(startsAt: string | null, baselineStartUtc: string): boolean {
+    if (!startsAt) {
+      return false;
+    }
+
+    const startsAtMs = Date.parse(startsAt);
+    const baselineMs = Date.parse(baselineStartUtc);
+    if (Number.isNaN(startsAtMs) || Number.isNaN(baselineMs)) {
+      return false;
+    }
+
+    return startsAtMs >= baselineMs;
+  }
+
+  private createInventoryEntry(
+    provider: 'bitrix' | 'yandex',
+    payload: { id: string; startsAt: string | null; title: string | null; updatedAt: string | null },
+  ): SyncTraceItem['inventory'] {
+    return {
+      id: payload.id,
+      provider,
+      startsAt: payload.startsAt,
+      title: payload.title,
+      updatedAt: payload.updatedAt,
+    };
+  }
+
+  private toMappingSnapshot(mapping: ReturnType<SQLiteService['getEventMappingByBitrixId']>): Record<string, unknown> | null {
+    if (!mapping) {
+      return null;
+    }
+
+    return {
+      bitrixEventId: mapping.bitrixEventId,
+      deferredReasonCodes: mapping.deferredReasonCodes,
+      deletedAt: mapping.deletedAt,
+      deletedBy: mapping.deletedBy,
+      lastDecisionReason: mapping.lastDecisionReason,
+      lastHealingReason: mapping.lastHealingReason,
+      sourceFingerprint: mapping.sourceFingerprint,
+      status: mapping.status,
+      targetFingerprint: mapping.targetFingerprint,
+      yandexEventUid: mapping.yandexEventUid,
+      yandexEventUrl: mapping.yandexEventUrl,
+    };
+  }
+
+  private appendTraceItem(trace: SyncDebugTrace, item: SyncTraceItem): void {
+    if (!item.baselineIncluded) {
+      return;
+    }
+
+    trace.trail.push(item);
+    trace.summary.trailCount = trace.trail.length;
+  }
+
+  private finalizeDebugTrace(
+    trace: SyncDebugTrace,
+    status: SyncDebugTrace['runMeta']['status'],
+    finishedAt: string,
+    bitrixCursorAfter: string | null,
+    yandexCursorAfter: string | null,
+    note: string | null,
+  ): SyncDebugTrace {
+    trace.runMeta.status = status;
+    trace.runMeta.finishedAt = finishedAt;
+    trace.cursorDiagnostics.bitrix.after = bitrixCursorAfter;
+    trace.cursorDiagnostics.yandex.after = yandexCursorAfter;
+    trace.cursorDiagnostics.bitrix.note = note;
+    trace.cursorDiagnostics.yandex.note = note;
+
+    return trace;
+  }
+
+  public getDebugTrace(connectionId: string): SyncDebugTraceResponse {
+    const state = this.sqliteService.getSyncState(connectionId);
+    if (!state.lastDebugTrace) {
+      return {
+        available: false,
+        markers: [],
+        trace: null,
+        truncated: false,
+      };
+    }
+
+    const safe = sanitizeAndTruncateTracePayload(state.lastDebugTrace);
+    return {
+      available: true,
+      markers: safe.markers,
+      trace: safe.payload as unknown as SyncDebugTrace,
+      truncated: safe.truncated,
+    };
+  }
+
   private computeOutcomeReason(
     baseReason: string,
     hadSoftFailures: boolean,
@@ -392,6 +618,7 @@ export class SyncService {
 
     const previousState = this.sqliteService.getSyncState(connectionId);
     const startedAt = new Date().toISOString();
+    const trace = this.createDebugTrace(connectionId, trigger, startedAt, previousState);
     this.connectionInFlight.add(connectionId);
     this.sqliteService.updateSyncState(connectionId, {
       activeDirection: trigger,
@@ -411,12 +638,23 @@ export class SyncService {
 
     try {
       const stats = webhookPayload
-        ? await this.runWebhookAcceleratedSync(connectionId, webhookPayload, previousState)
-        : await this.runIncrementalSync(connectionId, previousState, startedAt);
+        ? await this.runWebhookAcceleratedSync(connectionId, webhookPayload, previousState, trace)
+        : await this.runIncrementalSync(connectionId, previousState, startedAt, trace);
+
+      const finishedAt = new Date().toISOString();
+      const finalizedTrace = this.finalizeDebugTrace(
+        trace,
+        'success',
+        finishedAt,
+        startedAt,
+        startedAt,
+        stats.outcomeReason === 'incremental_sync_completed_with_soft_failures' ? 'cursor_advanced_with_soft_failures' : null,
+      );
 
       this.sqliteService.updateSyncState(connectionId, {
         activeDirection: null,
         bitrixSyncCursor: startedAt,
+        lastDebugTrace: finalizedTrace as unknown as Record<string, unknown>,
         lastOutcomeReason: stats.outcomeReason,
         lastProcessedBitrixEvents: stats.processedBitrixEvents,
         lastProcessedYandexEvents: stats.processedYandexEvents,
@@ -438,6 +676,18 @@ export class SyncService {
 
       return stats;
     } catch (error: unknown) {
+      const finishedAt = new Date().toISOString();
+      const finalizedTrace = this.finalizeDebugTrace(
+        trace,
+        'error',
+        finishedAt,
+        previousState.bitrixSyncCursor,
+        previousState.yandexSyncCursor,
+        'mutation_error',
+      );
+      this.sqliteService.updateSyncState(connectionId, {
+        lastDebugTrace: finalizedTrace as unknown as Record<string, unknown>,
+      });
       this.captureSyncError(connectionId, error);
       this.log('Connection sync failed.', {
         connectionId,
@@ -450,11 +700,20 @@ export class SyncService {
     }
   }
 
-  private async runIncrementalSync(connectionId: string, previousState: SyncState, startedAt: string): Promise<SyncExecutionStats> {
+  private async runIncrementalSync(connectionId: string, previousState: SyncState, startedAt: string, trace: SyncDebugTrace): Promise<SyncExecutionStats> {
     const bitrixEvents = await this.bitrixService.listEventsSince(connectionId, previousState.bitrixSyncCursor);
+    const baselineStart = trace.baseline.startsAtGteUtc;
     let hadSoftFailures = false;
     const observability = this.createObservabilityAccumulator();
     observability.counters.processedBitrixEvents = bitrixEvents.length;
+    trace.inventory.bitrix = bitrixEvents
+      .map((event) => this.createInventoryEntry('bitrix', {
+        id: event.id,
+        startsAt: event.startsAt,
+        title: event.title,
+        updatedAt: event.updatedAt,
+      }))
+      .filter((item) => this.isBaselineEvent(item.startsAt, baselineStart));
 
     syncDebug({
       bitrixCursor: previousState.bitrixSyncCursor,
@@ -474,7 +733,7 @@ export class SyncService {
 
     for (const event of bitrixEvents) {
       try {
-        const result = await this.syncBitrixEvent(connectionId, event);
+        const result = await this.syncBitrixEvent(connectionId, event, trace, previousState.bitrixSyncCursor, startedAt);
         if (result.skipped && result.reason) {
           this.noteSkip(observability, result.reason);
         }
@@ -483,7 +742,38 @@ export class SyncService {
         }
       } catch (error: unknown) {
         hadSoftFailures = true;
+        trace.summary.softFailures += 1;
         this.noteError(observability, 'bitrix_event_soft_failed');
+        this.incrementTraceReason(trace, 'mutation_error');
+        this.appendTraceItem(trace, {
+          baselineIncluded: this.isBaselineEvent(event.startsAt, trace.baseline.startsAtGteUtc),
+          cursor: {
+            after: startedAt,
+            before: previousState.bitrixSyncCursor,
+            note: 'cursor_advanced_with_soft_failures',
+          },
+          decision: {
+            action: 'unknown',
+            explanation: 'Bitrix event failed during mutation.',
+            reason: 'mutation_error',
+          },
+          direction: 'bitrix_to_yandex',
+          eventKey: event.id,
+          fieldParity: null,
+          inventory: this.createInventoryEntry('bitrix', {
+            id: event.id,
+            startsAt: event.startsAt,
+            title: event.title,
+            updatedAt: event.updatedAt,
+          }),
+          mappingDelta: null,
+          mutation: {
+            errorClass: error instanceof Error ? error.name : 'UnknownError',
+            executedAction: 'none',
+            intendedAction: 'create_or_update_target',
+            outcome: 'error',
+          },
+        });
         syncWarn('Bitrix event failed during sync and was skipped.', {
           connectionId,
           error: error instanceof Error ? error.message : 'Unknown error',
@@ -494,7 +784,7 @@ export class SyncService {
       }
     }
 
-    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, startedAt, observability);
+    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, startedAt, observability, trace);
     hadSoftFailures = hadSoftFailures || yandexResult.hadSoftFailures;
 
     syncDebug({
@@ -526,7 +816,7 @@ export class SyncService {
     };
   }
 
-  private async runWebhookAcceleratedSync(connectionId: string, payload: Record<string, unknown>, previousState: SyncState): Promise<SyncExecutionStats> {
+  private async runWebhookAcceleratedSync(connectionId: string, payload: Record<string, unknown>, previousState: SyncState, trace: SyncDebugTrace): Promise<SyncExecutionStats> {
     const descriptor = this.describeWebhookPayload(payload);
     let processedBitrixEvents = 0;
     let hadSoftFailures = false;
@@ -543,7 +833,7 @@ export class SyncService {
           processedBitrixEvents = 1;
           observability.counters.processedBitrixEvents = 1;
           try {
-            const result = await this.syncBitrixEvent(connectionId, event);
+            const result = await this.syncBitrixEvent(connectionId, event, trace, previousState.bitrixSyncCursor, new Date().toISOString());
             if (result.skipped && result.reason) {
               this.noteSkip(observability, result.reason);
             }
@@ -565,7 +855,7 @@ export class SyncService {
       }
     }
 
-    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, new Date().toISOString(), observability);
+    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, new Date().toISOString(), observability, trace);
     hadSoftFailures = hadSoftFailures || yandexResult.hadSoftFailures;
     const outcomeReason = this.computeOutcomeReason(
       descriptor.action === 'delete' ? 'bitrix_webhook_delete_processed' : 'bitrix_webhook_upsert_processed',
@@ -587,13 +877,23 @@ export class SyncService {
     previousState: SyncState,
     startedAt: string,
     observability: SyncRunObservabilityAccumulator,
+    trace: SyncDebugTrace,
   ): Promise<{ processedEvents: number; skippedRecurringEvents: number; hadSoftFailures: boolean; healedMappings: number }> {
     const results = await this.yandexService.listEventResults(connectionId);
     const events = results.filter((result): result is { ok: true; value: YandexCalendarEvent } => result.ok).map((result) => result.value);
+    const baselineStart = trace.baseline.startsAtGteUtc;
     const observedUrls = new Set(events.map((event) => event.url));
     let processedEvents = 0;
     let hadSoftFailures = false;
     observability.counters.processedYandexEvents = 0;
+    trace.inventory.yandex = events
+      .map((event) => this.createInventoryEntry('yandex', {
+        id: event.uid || event.url,
+        startsAt: event.startsAt,
+        title: event.summary,
+        updatedAt: event.updatedAt,
+      }))
+      .filter((item) => this.isBaselineEvent(item.startsAt, baselineStart));
 
     syncDebug({
       connectionId,
@@ -613,11 +913,42 @@ export class SyncService {
     for (const result of results) {
       if (!result.ok) {
         hadSoftFailures = true;
+        trace.summary.softFailures += 1;
         const observedUrl = this.getNormalizationDetailString(result.issue, 'url');
         if (observedUrl) {
           observedUrls.add(observedUrl);
         }
         this.noteSkip(observability, result.issue.reason);
+        this.incrementTraceReason(trace, result.issue.reason);
+        this.appendTraceItem(trace, {
+          baselineIncluded: this.isBaselineEvent(this.getNormalizationDetailString(result.issue, 'startsAt'), trace.baseline.startsAtGteUtc),
+          cursor: {
+            after: startedAt,
+            before: previousState.yandexSyncCursor,
+            note: 'cursor_advanced_with_soft_failures',
+          },
+          decision: {
+            action: 'skip',
+            explanation: 'Normalization rejected Yandex payload.',
+            reason: result.issue.reason,
+          },
+          direction: 'yandex_to_bitrix',
+          eventKey: observedUrl ?? this.getNormalizationDetailString(result.issue, 'uid') ?? 'unknown',
+          fieldParity: null,
+          inventory: this.createInventoryEntry('yandex', {
+            id: observedUrl ?? 'unknown',
+            startsAt: this.getNormalizationDetailString(result.issue, 'startsAt'),
+            title: this.getNormalizationDetailString(result.issue, 'summary'),
+            updatedAt: this.getNormalizationDetailString(result.issue, 'updatedAt'),
+          }),
+          mappingDelta: null,
+          mutation: {
+            errorClass: null,
+            executedAction: 'none',
+            intendedAction: 'skip',
+            outcome: 'skipped',
+          },
+        });
         this.logNormalizationIssue(connectionId, 'sync.yandexEvent.skip', result.issue);
         continue;
       }
@@ -630,7 +961,7 @@ export class SyncService {
       processedEvents += 1;
       observability.counters.processedYandexEvents = processedEvents;
       try {
-        const outcome = await this.syncYandexEvent(connectionId, event);
+        const outcome = await this.syncYandexEvent(connectionId, event, trace, previousState.yandexSyncCursor, startedAt);
         if (outcome.skipped && outcome.reason) {
           this.noteSkip(observability, outcome.reason);
         }
@@ -639,7 +970,38 @@ export class SyncService {
         }
       } catch (error: unknown) {
         hadSoftFailures = true;
+        trace.summary.softFailures += 1;
         this.noteError(observability, 'yandex_event_soft_failed');
+        this.incrementTraceReason(trace, 'mutation_error');
+        this.appendTraceItem(trace, {
+          baselineIncluded: this.isBaselineEvent(event.startsAt, trace.baseline.startsAtGteUtc),
+          cursor: {
+            after: startedAt,
+            before: previousState.yandexSyncCursor,
+            note: 'cursor_advanced_with_soft_failures',
+          },
+          decision: {
+            action: 'unknown',
+            explanation: 'Yandex event failed during mutation.',
+            reason: 'mutation_error',
+          },
+          direction: 'yandex_to_bitrix',
+          eventKey: event.uid || event.url,
+          fieldParity: null,
+          inventory: this.createInventoryEntry('yandex', {
+            id: event.uid || event.url,
+            startsAt: event.startsAt,
+            title: event.summary,
+            updatedAt: event.updatedAt,
+          }),
+          mappingDelta: null,
+          mutation: {
+            errorClass: error instanceof Error ? error.name : 'UnknownError',
+            executedAction: 'none',
+            intendedAction: 'create_or_update_target',
+            outcome: 'error',
+          },
+        });
         syncWarn('Yandex event failed during sync and was skipped.', {
           connectionId,
           error: error instanceof Error ? error.message : 'Unknown error',
@@ -660,6 +1022,7 @@ export class SyncService {
       const healedEvent = mapping.yandexEventUid ? events.find((event) => event.uid === mapping.yandexEventUid) ?? null : null;
       if (healedEvent) {
         this.noteHealing(observability, 'yandex_mapping_healed_by_uid');
+        this.incrementTraceReason(trace, 'stale_mapping_healed');
         this.sqliteService.upsertEventMapping({
           ...mapping,
           deferredReasonCodes: mapping.deferredReasonCodes,
@@ -699,6 +1062,7 @@ export class SyncService {
         lastWinner: 'yandex',
         status: 'deleted',
       });
+      this.incrementTraceReason(trace, 'stale_mapping_unresolved');
     }
 
     return {
@@ -730,7 +1094,34 @@ export class SyncService {
     return !Number.isNaN(updatedAtMs) && !Number.isNaN(cursorMs) && updatedAtMs > cursorMs;
   }
 
-  private async syncBitrixEvent(connectionId: string, event: BitrixCalendarEvent): Promise<EventSyncResult> {
+  private async syncBitrixEvent(
+    connectionId: string,
+    event: BitrixCalendarEvent,
+    trace: SyncDebugTrace,
+    cursorBefore: string | null,
+    cursorAfter: string | null,
+  ): Promise<EventSyncResult> {
+    const baselineIncluded = this.isBaselineEvent(event.startsAt, trace.baseline.startsAtGteUtc);
+    const traceItem: SyncTraceItem = {
+      baselineIncluded,
+      cursor: {
+        after: cursorAfter,
+        before: cursorBefore,
+        note: null,
+      },
+      decision: null,
+      direction: 'bitrix_to_yandex',
+      eventKey: event.id,
+      fieldParity: null,
+      inventory: this.createInventoryEntry('bitrix', {
+        id: event.id,
+        startsAt: event.startsAt,
+        title: event.title,
+        updatedAt: event.updatedAt,
+      }),
+      mappingDelta: null,
+      mutation: null,
+    };
     const selectedCalendarId = this.sqliteService.getConnectionById(connectionId)?.bitrixCalendarId ?? null;
     syncDebug({
       connectionId,
@@ -749,11 +1140,24 @@ export class SyncService {
 
     const normalized = normalizeBitrixEventForSync(event, selectedCalendarId);
     if (!normalized.ok) {
+      traceItem.decision = {
+        action: 'skip',
+        explanation: 'Event normalization rejected the source payload.',
+        reason: normalized.issue.reason,
+      };
+      traceItem.mutation = {
+        errorClass: null,
+        executedAction: 'none',
+        intendedAction: 'skip',
+        outcome: 'skipped',
+      };
+      this.incrementTraceReason(trace, normalized.issue.reason);
       if (normalized.issue.reason === 'recurrence_unsupported') {
         this.noteRecurringSkip(connectionId, `Skipped Bitrix event ${event.id}: recurring events are unsupported in MVP.`);
       }
 
       this.logNormalizationIssue(connectionId, 'sync.bitrixEvent.skip', normalized.issue, { eventId: event.id });
+      this.appendTraceItem(trace, traceItem);
       return {
         reason: normalized.issue.reason,
         skipped: true,
@@ -761,6 +1165,7 @@ export class SyncService {
     }
 
     const mapping = this.sqliteService.getEventMappingByBitrixId(connectionId, event.id);
+    const beforeMappingSnapshot = this.toMappingSnapshot(mapping);
     const fingerprint = buildBitrixEventFingerprint(event);
     const decision = resolveConflict({
       sourceProvider: 'bitrix',
@@ -773,6 +1178,12 @@ export class SyncService {
     });
 
     this.sqliteService.updateSyncState(connectionId, { lastOutcomeReason: decision.reason });
+    traceItem.decision = {
+      action: decision.action,
+      explanation: 'Conflict resolver selected sync action for Bitrix source event.',
+      reason: decision.reason,
+    };
+    this.incrementTraceReason(trace, decision.reason);
     syncDebug({
       connectionId,
       decision,
@@ -782,11 +1193,29 @@ export class SyncService {
     });
 
     if (decision.action === 'skip') {
+      traceItem.mutation = {
+        errorClass: null,
+        executedAction: 'none',
+        intendedAction: 'skip',
+        outcome: 'skipped',
+      };
+      this.appendTraceItem(trace, traceItem);
       return { skipped: false };
     }
 
     if (decision.action === 'delete') {
       await this.handleBitrixDeletion(connectionId, event.id);
+      traceItem.mutation = {
+        errorClass: null,
+        executedAction: 'delete_target',
+        intendedAction: 'delete_target',
+        outcome: 'executed',
+      };
+      traceItem.mappingDelta = {
+        after: this.toMappingSnapshot(this.sqliteService.getEventMappingByBitrixId(connectionId, event.id)),
+        before: beforeMappingSnapshot,
+      };
+      this.appendTraceItem(trace, traceItem);
       return { skipped: false };
     }
 
@@ -860,6 +1289,23 @@ export class SyncService {
       yandexEventUrl: syncedEvent.url,
     });
 
+    traceItem.mutation = {
+      errorClass: null,
+      executedAction: decision.action === 'create' ? 'create_target' : 'update_target',
+      intendedAction: decision.action,
+      outcome: 'executed',
+    };
+    traceItem.mappingDelta = {
+      after: this.toMappingSnapshot(this.sqliteService.getEventMappingByBitrixId(connectionId, event.id)),
+      before: beforeMappingSnapshot,
+    };
+    traceItem.fieldParity = {
+      appliedFields: ['title', 'description', 'startsAt', 'endsAt', 'isAllDay'],
+      deferredReasonCodes: draft.preserved?.deferredReasonCodes ?? [],
+      preservedFields: draft.preserved?.deferredReasonCodes?.map((code) => code.replace(/^bitrix_|^yandex_/, '').replace(/_deferred$/, '')) ?? [],
+    };
+    this.appendTraceItem(trace, traceItem);
+
     return {
       healed,
       healingReason: healed ? 'stale_mapping_healed' : undefined,
@@ -867,7 +1313,34 @@ export class SyncService {
     };
   }
 
-  private async syncYandexEvent(connectionId: string, event: YandexCalendarEvent): Promise<EventSyncResult> {
+  private async syncYandexEvent(
+    connectionId: string,
+    event: YandexCalendarEvent,
+    trace: SyncDebugTrace,
+    cursorBefore: string | null,
+    cursorAfter: string | null,
+  ): Promise<EventSyncResult> {
+    const baselineIncluded = this.isBaselineEvent(event.startsAt, trace.baseline.startsAtGteUtc);
+    const traceItem: SyncTraceItem = {
+      baselineIncluded,
+      cursor: {
+        after: cursorAfter,
+        before: cursorBefore,
+        note: null,
+      },
+      decision: null,
+      direction: 'yandex_to_bitrix',
+      eventKey: event.uid || event.url,
+      fieldParity: null,
+      inventory: this.createInventoryEntry('yandex', {
+        id: event.uid || event.url,
+        startsAt: event.startsAt,
+        title: event.summary,
+        updatedAt: event.updatedAt,
+      }),
+      mappingDelta: null,
+      mutation: null,
+    };
     syncDebug({
       connectionId,
       event: {
@@ -883,17 +1356,31 @@ export class SyncService {
     });
 
     if (event.recurrenceRule) {
+      traceItem.decision = {
+        action: 'skip',
+        explanation: 'Recurring events are expected skip in current sync baseline.',
+        reason: 'recurrence_unsupported',
+      };
+      traceItem.mutation = {
+        errorClass: null,
+        executedAction: 'none',
+        intendedAction: 'skip',
+        outcome: 'skipped',
+      };
+      this.incrementTraceReason(trace, 'recurrence_unsupported');
       this.noteRecurringSkip(connectionId, `Skipped Yandex event ${event.uid}: recurring events are unsupported in MVP.`);
       this.logNormalizationIssue(connectionId, 'sync.yandexEvent.skip', {
         kind: 'skip',
         provider: 'yandex',
         reason: 'recurrence_unsupported',
       }, { uid: event.uid, url: event.url });
+      this.appendTraceItem(trace, traceItem);
       return { reason: 'recurrence_unsupported', skipped: true };
     }
 
     const mapping = this.sqliteService.getEventMappingByYandexUrl(connectionId, event.url)
       ?? (event.uid ? this.sqliteService.getEventMappingByYandexUid(connectionId, event.uid) : null);
+    const beforeMappingSnapshot = this.toMappingSnapshot(mapping);
     const fingerprint = buildYandexEventFingerprint(event);
     const decision = resolveConflict({
       sourceProvider: 'yandex',
@@ -906,6 +1393,12 @@ export class SyncService {
     });
 
     this.sqliteService.updateSyncState(connectionId, { lastOutcomeReason: decision.reason });
+    traceItem.decision = {
+      action: decision.action,
+      explanation: 'Conflict resolver selected sync action for Yandex source event.',
+      reason: decision.reason,
+    };
+    this.incrementTraceReason(trace, decision.reason);
     syncDebug({
       connectionId,
       decision,
@@ -916,6 +1409,13 @@ export class SyncService {
     });
 
     if (decision.action === 'skip') {
+      traceItem.mutation = {
+        errorClass: null,
+        executedAction: 'none',
+        intendedAction: 'skip',
+        outcome: 'skipped',
+      };
+      this.appendTraceItem(trace, traceItem);
       return { skipped: false };
     }
 
@@ -966,6 +1466,23 @@ export class SyncService {
       yandexEventUid: event.uid,
       yandexEventUrl: event.url,
     });
+
+    traceItem.mutation = {
+      errorClass: null,
+      executedAction: decision.action === 'update' ? 'update_target' : 'create_target',
+      intendedAction: decision.action,
+      outcome: 'executed',
+    };
+    traceItem.mappingDelta = {
+      after: this.toMappingSnapshot(this.sqliteService.getEventMappingByYandexUrl(connectionId, event.url)),
+      before: beforeMappingSnapshot,
+    };
+    traceItem.fieldParity = {
+      appliedFields: ['title', 'description', 'startsAt', 'endsAt', 'isAllDay'],
+      deferredReasonCodes: draft.preserved?.deferredReasonCodes ?? [],
+      preservedFields: draft.preserved?.deferredReasonCodes?.map((code) => code.replace(/^bitrix_|^yandex_/, '').replace(/_deferred$/, '')) ?? [],
+    };
+    this.appendTraceItem(trace, traceItem);
 
     return {
       healed: Boolean(mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url),
@@ -1066,9 +1583,18 @@ export class SyncService {
   private applyNoopPreflight(connectionId: string, path: SyncExecutionPath, preflight: ManualResyncPreflight): SyncStatusResponse {
     const attemptedAt = new Date().toISOString();
     const currentState = this.sqliteService.getSyncState(connectionId);
+    const noopTrace = this.finalizeDebugTrace(
+      this.createDebugTrace(connectionId, path, attemptedAt, currentState),
+      'noop',
+      attemptedAt,
+      currentState.bitrixSyncCursor,
+      currentState.yandexSyncCursor,
+      `${path}_${preflight.reason}_noop`,
+    );
 
     this.sqliteService.updateSyncState(connectionId, {
       activeDirection: null,
+      lastDebugTrace: noopTrace as unknown as Record<string, unknown>,
       lastErrorAt: null,
       lastErrorMessage: null,
       lastOutcomeReason: `${path}_${preflight.reason}_noop`,
