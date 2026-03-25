@@ -160,17 +160,29 @@ function renderDebugTrace(debugTrace) {
 
   const masked = maskSecrets(debugTrace.trace);
   const summary = masked.summary || {};
+  const providerCallErrors = summary.providerCallErrors || {};
+  const hasProviderErrors = Object.keys(providerCallErrors).length > 0;
+  const hasEmptyTrail = (summary.trailCount ?? 0) === 0;
   diagnosticsSummary.textContent = [
     `run: ${masked.runMeta?.trigger || '-'} (${masked.runMeta?.status || '-'})`,
+    `fetched: bitrix=${summary.bitrixFetchedCount ?? 0}, yandex=${summary.yandexFetchedCount ?? 0}`,
+    `excluded by baseline: ${summary.excludedByBaselineCount ?? 0}`,
     `trail events (today+): ${summary.trailCount ?? 0}`,
     `soft failures: ${summary.softFailures ?? 0}`,
     `expected recurring skips: ${summary.expectedRecurringSkips ?? 0}`,
+    `provider call errors: ${hasProviderErrors ? JSON.stringify(providerCallErrors) : 'none'}`,
     `markers: ${debugTrace.markers?.length || 0}, truncated: ${Boolean(debugTrace.truncated)}`,
+    hasEmptyTrail
+      ? 'trail empty: проверьте baseline, выбранный календарь и provider call errors (см. консоль)'
+      : '',
   ].join('\n');
   diagnosticsRaw.textContent = JSON.stringify({ ...debugTrace, trace: masked }, null, 2);
 
   console.groupCollapsed('[onboarding][sync-debug] summary');
   console.table(summary.reasonBuckets || {});
+  if (hasProviderErrors) {
+    console.table(providerCallErrors);
+  }
   console.log(masked.runMeta);
   console.groupEnd();
 

@@ -26,6 +26,11 @@ interface BitrixResponseEnvelope<T> {
   error_description?: string;
 }
 
+interface BitrixCallRetryState {
+  allowRefreshRetry: boolean;
+  rateLimitAttempt: number;
+}
+
 type BitrixPayload = Record<string, unknown>;
 
 function buildFallbackBitrixEvent(eventId: string, draft: BitrixCalendarDraft, calendarId: string | null): BitrixCalendarEvent {
@@ -62,6 +67,8 @@ function buildFallbackBitrixEvent(eventId: string, draft: BitrixCalendarDraft, c
 }
 
 export class BitrixService {
+  private static readonly RATE_LIMIT_MAX_RETRIES = 4;
+
   public constructor(
     private readonly sqliteService: SQLiteService,
     private readonly bitrixAuthService: BitrixAuthService,
@@ -294,7 +301,12 @@ export class BitrixService {
     return buildBitrixEventFromRaw(payload);
   }
 
-  private async call<T>(connectionId: string, method: string, payload: Record<string, unknown>, allowRefreshRetry = true): Promise<T> {
+  private async call<T>(
+    connectionId: string,
+    method: string,
+    payload: Record<string, unknown>,
+    retryState: BitrixCallRetryState = { allowRefreshRetry: true, rateLimitAttempt: 0 },
+  ): Promise<T> {
     const context = this.sqliteService.getConnectionContext(connectionId);
     if (!context) {
       throw new Error(`Connection ${connectionId} was not found.`);
@@ -328,14 +340,29 @@ export class BitrixService {
       phase: 'bitrix.call.response',
       status: response.status,
     });
-    if (response.status === 503 && allowRefreshRetry) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      return this.call<T>(connectionId, method, payload, false);
+    if (this.isRateLimitedBitrixResponse(response.status, envelope.error) && retryState.rateLimitAttempt < BitrixService.RATE_LIMIT_MAX_RETRIES) {
+      const delayMs = this.computeRateLimitBackoffMs(retryState.rateLimitAttempt);
+      syncDebug({
+        attempt: retryState.rateLimitAttempt + 1,
+        connectionId,
+        delayMs,
+        method,
+        phase: 'bitrix.call.retry.rate_limit',
+        reason: envelope.error ?? `status_${response.status}`,
+      });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return this.call<T>(connectionId, method, payload, {
+        allowRefreshRetry: retryState.allowRefreshRetry,
+        rateLimitAttempt: retryState.rateLimitAttempt + 1,
+      });
     }
 
-    if ((!response.ok || envelope.error) && allowRefreshRetry && this.isRefreshableBitrixError(response.status, envelope.error)) {
+    if ((!response.ok || envelope.error) && retryState.allowRefreshRetry && this.isRefreshableBitrixError(response.status, envelope.error)) {
       await this.bitrixAuthService.refreshInstallationAuth(context.installation);
-      return this.call<T>(connectionId, method, payload, false);
+      return this.call<T>(connectionId, method, payload, {
+        allowRefreshRetry: false,
+        rateLimitAttempt: retryState.rateLimitAttempt,
+      });
     }
 
     if (!response.ok) {
@@ -356,5 +383,21 @@ export class BitrixService {
 
     const normalized = (errorCode ?? '').toLowerCase();
     return normalized.includes('expired') || normalized.includes('invalid_token') || normalized.includes('token');
+  }
+
+  private isRateLimitedBitrixResponse(statusCode: number, errorCode: string | undefined): boolean {
+    if (statusCode === 429 || statusCode === 503) {
+      return true;
+    }
+
+    const normalized = (errorCode ?? '').toLowerCase();
+    return normalized.includes('query_limit_exceeded') || normalized.includes('too_many_requests') || normalized.includes('rate_limit');
+  }
+
+  private computeRateLimitBackoffMs(attempt: number): number {
+    const baseDelayMs = 300;
+    const exponential = baseDelayMs * (2 ** attempt);
+    const jitter = Math.floor(Math.random() * 120);
+    return Math.min(5000, exponential + jitter);
   }
 }

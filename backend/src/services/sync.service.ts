@@ -100,11 +100,15 @@ interface WebhookDescriptor {
 type SyncExecutionPath = 'bitrix_webhook' | 'manual_sync' | 'scheduled_poll' | 'startup_initial' | 'settings_enabled';
 
 interface SyncExecutionStats {
+  bitrixCursorAfter: string | null;
+  bitrixCursorNote: string | null;
   observability: SyncRunObservability;
   processedBitrixEvents: number;
   processedYandexEvents: number;
   skippedRecurringEvents: number;
   outcomeReason: string;
+  yandexCursorAfter: string | null;
+  yandexCursorNote: string | null;
 }
 
 interface EventSyncResult {
@@ -177,10 +181,14 @@ interface SyncDebugTrace {
     trigger: SyncExecutionPath;
   };
   summary: {
+    bitrixFetchedCount: number;
+    excludedByBaselineCount: number;
     expectedRecurringSkips: number;
+    providerCallErrors: Record<string, number>;
     reasonBuckets: Record<string, number>;
     softFailures: number;
     trailCount: number;
+    yandexFetchedCount: number;
   };
   trail: SyncTraceItem[];
   version: 'v1';
@@ -402,14 +410,23 @@ export class SyncService {
         trigger,
       },
       summary: {
+        bitrixFetchedCount: 0,
+        excludedByBaselineCount: 0,
         expectedRecurringSkips: 0,
+        providerCallErrors: {},
         reasonBuckets: {},
         softFailures: 0,
         trailCount: 0,
+        yandexFetchedCount: 0,
       },
       trail: [],
       version: 'v1',
     };
+  }
+
+  private noteProviderCallError(trace: SyncDebugTrace, reason: string): void {
+    trace.summary.providerCallErrors[reason] = (trace.summary.providerCallErrors[reason] ?? 0) + 1;
+    this.incrementTraceReason(trace, reason);
   }
 
   private incrementTraceReason(trace: SyncDebugTrace, reason: string): void {
@@ -486,14 +503,15 @@ export class SyncService {
     finishedAt: string,
     bitrixCursorAfter: string | null,
     yandexCursorAfter: string | null,
-    note: string | null,
+    bitrixNote: string | null,
+    yandexNote: string | null,
   ): SyncDebugTrace {
     trace.runMeta.status = status;
     trace.runMeta.finishedAt = finishedAt;
     trace.cursorDiagnostics.bitrix.after = bitrixCursorAfter;
     trace.cursorDiagnostics.yandex.after = yandexCursorAfter;
-    trace.cursorDiagnostics.bitrix.note = note;
-    trace.cursorDiagnostics.yandex.note = note;
+    trace.cursorDiagnostics.bitrix.note = bitrixNote;
+    trace.cursorDiagnostics.yandex.note = yandexNote;
 
     return trace;
   }
@@ -595,11 +613,15 @@ export class SyncService {
         trigger,
       });
       return {
+        bitrixCursorAfter: null,
+        bitrixCursorNote: null,
         observability: this.createEmptyRunObservability(),
         processedBitrixEvents: 0,
         processedYandexEvents: 0,
         skippedRecurringEvents: 0,
         outcomeReason: `${trigger}_already_running`,
+        yandexCursorAfter: null,
+        yandexCursorNote: null,
       };
     }
 
@@ -608,11 +630,15 @@ export class SyncService {
     if (!preflight.allowed) {
       this.applyNoopPreflight(connectionId, trigger, preflight);
       return {
+        bitrixCursorAfter: null,
+        bitrixCursorNote: null,
         observability: this.createEmptyRunObservability(),
         processedBitrixEvents: 0,
         processedYandexEvents: 0,
         skippedRecurringEvents: 0,
         outcomeReason: `${trigger}_${preflight.reason}_noop`,
+        yandexCursorAfter: null,
+        yandexCursorNote: null,
       };
     }
 
@@ -638,7 +664,7 @@ export class SyncService {
 
     try {
       const stats = webhookPayload
-        ? await this.runWebhookAcceleratedSync(connectionId, webhookPayload, previousState, trace)
+        ? await this.runWebhookAcceleratedSync(connectionId, webhookPayload, previousState, startedAt, trace)
         : await this.runIncrementalSync(connectionId, previousState, startedAt, trace);
 
       const finishedAt = new Date().toISOString();
@@ -646,14 +672,15 @@ export class SyncService {
         trace,
         'success',
         finishedAt,
-        startedAt,
-        startedAt,
-        stats.outcomeReason === 'incremental_sync_completed_with_soft_failures' ? 'cursor_advanced_with_soft_failures' : null,
+        stats.bitrixCursorAfter,
+        stats.yandexCursorAfter,
+        stats.bitrixCursorNote,
+        stats.yandexCursorNote,
       );
 
       this.sqliteService.updateSyncState(connectionId, {
         activeDirection: null,
-        bitrixSyncCursor: startedAt,
+        bitrixSyncCursor: stats.bitrixCursorAfter,
         lastDebugTrace: finalizedTrace as unknown as Record<string, unknown>,
         lastOutcomeReason: stats.outcomeReason,
         lastProcessedBitrixEvents: stats.processedBitrixEvents,
@@ -663,7 +690,7 @@ export class SyncService {
         lastSuccessAt: new Date().toISOString(),
         pollingFailureCount: 0,
         status: 'success',
-        yandexSyncCursor: startedAt,
+        yandexSyncCursor: stats.yandexCursorAfter,
       });
 
       this.log('Connection sync completed.', {
@@ -684,6 +711,7 @@ export class SyncService {
         previousState.bitrixSyncCursor,
         previousState.yandexSyncCursor,
         'mutation_error',
+        'mutation_error',
       );
       this.sqliteService.updateSyncState(connectionId, {
         lastDebugTrace: finalizedTrace as unknown as Record<string, unknown>,
@@ -701,10 +729,27 @@ export class SyncService {
   }
 
   private async runIncrementalSync(connectionId: string, previousState: SyncState, startedAt: string, trace: SyncDebugTrace): Promise<SyncExecutionStats> {
-    const bitrixEvents = await this.bitrixService.listEventsSince(connectionId, previousState.bitrixSyncCursor);
+    let bitrixEvents: BitrixCalendarEvent[] = [];
+    let bitrixFetchFailed = false;
     const baselineStart = trace.baseline.startsAtGteUtc;
     let hadSoftFailures = false;
     const observability = this.createObservabilityAccumulator();
+    try {
+      bitrixEvents = await this.bitrixService.listEventsSince(connectionId, previousState.bitrixSyncCursor);
+    } catch (error: unknown) {
+      bitrixFetchFailed = true;
+      hadSoftFailures = true;
+      trace.summary.softFailures += 1;
+      this.noteError(observability, 'bitrix_fetch_failed');
+      this.noteProviderCallError(trace, 'bitrix_list_events_failed');
+      syncWarn('Bitrix event list fetch failed; preserving Bitrix cursor for this run.', {
+        connectionId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        phase: 'sync.bitrixEvents.fetch.error',
+        reason: 'bitrix_list_events_failed',
+      });
+    }
+
     observability.counters.processedBitrixEvents = bitrixEvents.length;
     trace.inventory.bitrix = bitrixEvents
       .map((event) => this.createInventoryEntry('bitrix', {
@@ -714,6 +759,8 @@ export class SyncService {
         updatedAt: event.updatedAt,
       }))
       .filter((item) => this.isBaselineEvent(item.startsAt, baselineStart));
+    trace.summary.bitrixFetchedCount = bitrixEvents.length;
+    trace.summary.excludedByBaselineCount += bitrixEvents.length - trace.inventory.bitrix.length;
 
     syncDebug({
       bitrixCursor: previousState.bitrixSyncCursor,
@@ -798,6 +845,8 @@ export class SyncService {
     });
 
     const outcomeReason = this.computeOutcomeReason('incremental_sync_completed', hadSoftFailures, observability);
+    const bitrixCursorAfter = bitrixFetchFailed ? previousState.bitrixSyncCursor : startedAt;
+    const yandexCursorAfter = yandexResult.fetchFailed ? previousState.yandexSyncCursor : startedAt;
 
     syncInfo('[sync-operational] incremental summary', {
       connectionId,
@@ -808,17 +857,32 @@ export class SyncService {
     });
 
     return {
+      bitrixCursorAfter,
+      bitrixCursorNote: bitrixFetchFailed
+        ? 'bitrix_cursor_preserved_due_to_fetch_failure'
+        : (hadSoftFailures ? 'cursor_advanced_with_soft_failures' : null),
       observability: this.finalizeObservability(observability),
       processedBitrixEvents: bitrixEvents.length,
       processedYandexEvents: yandexResult.processedEvents,
       skippedRecurringEvents: observability.counters.skippedRecurringEvents,
       outcomeReason,
+      yandexCursorAfter,
+      yandexCursorNote: yandexResult.fetchFailed
+        ? 'yandex_cursor_preserved_due_to_fetch_failure'
+        : (hadSoftFailures ? 'cursor_advanced_with_soft_failures' : null),
     };
   }
 
-  private async runWebhookAcceleratedSync(connectionId: string, payload: Record<string, unknown>, previousState: SyncState, trace: SyncDebugTrace): Promise<SyncExecutionStats> {
+  private async runWebhookAcceleratedSync(
+    connectionId: string,
+    payload: Record<string, unknown>,
+    previousState: SyncState,
+    startedAt: string,
+    trace: SyncDebugTrace,
+  ): Promise<SyncExecutionStats> {
     const descriptor = this.describeWebhookPayload(payload);
     let processedBitrixEvents = 0;
+    let bitrixFetchFailed = false;
     let hadSoftFailures = false;
     const observability = this.createObservabilityAccumulator();
 
@@ -828,7 +892,23 @@ export class SyncService {
         processedBitrixEvents = 1;
         observability.counters.processedBitrixEvents = 1;
       } else {
-        const event = await this.bitrixService.fetchEventById(connectionId, descriptor.eventId);
+        let event: BitrixCalendarEvent | null = null;
+        try {
+          event = await this.bitrixService.fetchEventById(connectionId, descriptor.eventId);
+        } catch (error: unknown) {
+          bitrixFetchFailed = true;
+          hadSoftFailures = true;
+          trace.summary.softFailures += 1;
+          this.noteError(observability, 'bitrix_fetch_failed');
+          this.noteProviderCallError(trace, 'bitrix_fetch_event_by_id_failed');
+          syncWarn('Bitrix webhook event fetch failed; preserving Bitrix cursor for this run.', {
+            connectionId,
+            error: error instanceof Error ? error.message : 'Unknown error',
+            eventId: descriptor.eventId,
+            phase: 'sync.bitrixWebhook.fetch.error',
+            reason: 'bitrix_fetch_event_by_id_failed',
+          });
+        }
         if (event) {
           processedBitrixEvents = 1;
           observability.counters.processedBitrixEvents = 1;
@@ -855,20 +935,30 @@ export class SyncService {
       }
     }
 
-    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, new Date().toISOString(), observability, trace);
+    const yandexResult = await this.runYandexIncrementalInternal(connectionId, previousState, startedAt, observability, trace);
     hadSoftFailures = hadSoftFailures || yandexResult.hadSoftFailures;
     const outcomeReason = this.computeOutcomeReason(
       descriptor.action === 'delete' ? 'bitrix_webhook_delete_processed' : 'bitrix_webhook_upsert_processed',
       hadSoftFailures,
       observability,
     );
+    const bitrixCursorAfter = bitrixFetchFailed ? previousState.bitrixSyncCursor : startedAt;
+    const yandexCursorAfter = yandexResult.fetchFailed ? previousState.yandexSyncCursor : startedAt;
 
     return {
+      bitrixCursorAfter,
+      bitrixCursorNote: bitrixFetchFailed
+        ? 'bitrix_cursor_preserved_due_to_fetch_failure'
+        : (hadSoftFailures ? 'cursor_advanced_with_soft_failures' : null),
       observability: this.finalizeObservability(observability),
       processedBitrixEvents,
       processedYandexEvents: yandexResult.processedEvents,
       skippedRecurringEvents: observability.counters.skippedRecurringEvents,
       outcomeReason,
+      yandexCursorAfter,
+      yandexCursorNote: yandexResult.fetchFailed
+        ? 'yandex_cursor_preserved_due_to_fetch_failure'
+        : (hadSoftFailures ? 'cursor_advanced_with_soft_failures' : null),
     };
   }
 
@@ -878,8 +968,31 @@ export class SyncService {
     startedAt: string,
     observability: SyncRunObservabilityAccumulator,
     trace: SyncDebugTrace,
-  ): Promise<{ processedEvents: number; skippedRecurringEvents: number; hadSoftFailures: boolean; healedMappings: number }> {
-    const results = await this.yandexService.listEventResults(connectionId);
+  ): Promise<{ processedEvents: number; skippedRecurringEvents: number; hadSoftFailures: boolean; healedMappings: number; fetchFailed: boolean }> {
+    let fetchFailed = false;
+    let results: Awaited<ReturnType<YandexCalDavService['listEventResults']>> = [];
+    try {
+      results = await this.yandexService.listEventResults(connectionId);
+    } catch (error: unknown) {
+      fetchFailed = true;
+      trace.summary.softFailures += 1;
+      this.noteError(observability, 'yandex_fetch_failed');
+      this.noteProviderCallError(trace, 'yandex_list_events_failed');
+      syncWarn('Yandex event list fetch failed; preserving Yandex cursor for this run.', {
+        connectionId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        phase: 'sync.yandexEvents.fetch.error',
+        reason: 'yandex_list_events_failed',
+      });
+      return {
+        fetchFailed,
+        hadSoftFailures: true,
+        healedMappings: observability.counters.healedMappings,
+        processedEvents: 0,
+        skippedRecurringEvents: observability.counters.skippedRecurringEvents,
+      };
+    }
+
     const events = results.filter((result): result is { ok: true; value: YandexCalendarEvent } => result.ok).map((result) => result.value);
     const baselineStart = trace.baseline.startsAtGteUtc;
     const observedUrls = new Set(events.map((event) => event.url));
@@ -894,6 +1007,8 @@ export class SyncService {
         updatedAt: event.updatedAt,
       }))
       .filter((item) => this.isBaselineEvent(item.startsAt, baselineStart));
+    trace.summary.yandexFetchedCount = events.length;
+    trace.summary.excludedByBaselineCount += events.length - trace.inventory.yandex.length;
 
     syncDebug({
       connectionId,
@@ -1066,6 +1181,7 @@ export class SyncService {
     }
 
     return {
+      fetchFailed,
       hadSoftFailures,
       healedMappings: observability.counters.healedMappings,
       processedEvents,
@@ -1590,6 +1706,7 @@ export class SyncService {
       currentState.bitrixSyncCursor,
       currentState.yandexSyncCursor,
       `${path}_${preflight.reason}_noop`,
+      `${path}_${preflight.reason}_noop`,
     );
 
     this.sqliteService.updateSyncState(connectionId, {
@@ -1657,11 +1774,13 @@ export class SyncService {
   private noteRecurringSkip(connectionId: string, message: string): void {
     const currentState = this.sqliteService.getSyncState(connectionId);
     this.sqliteService.updateSyncState(connectionId, {
-      lastErrorAt: new Date().toISOString(),
-      lastErrorMessage: message,
-      lastOutcomeReason: 'recurring_event_skipped',
       lastSkippedRecurringEvents: currentState.lastSkippedRecurringEvents + 1,
-      status: 'success',
+    });
+    syncWarn('Recurring event skipped in baseline sync scope.', {
+      connectionId,
+      message,
+      phase: 'sync.recurring.skip',
+      reason: 'recurrence_unsupported',
     });
   }
 

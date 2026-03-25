@@ -700,6 +700,83 @@ test('sync service debug trace reports recurring expected skip and cursor diagno
   }
 });
 
+test('sync service preserves Bitrix cursor on fetch failure and reports provider call diagnostics', async () => {
+  const temp = makeTempDbPath('debug-trace-bitrix-fetch-failure');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const { connection } = setupReadyConnection(sqliteService);
+    const previousBitrixCursor = '2026-03-25T08:00:00.000Z';
+    const previousYandexCursor = '2026-03-25T08:00:00.000Z';
+    sqliteService.updateSyncState(connection.id, {
+      bitrixSyncCursor: previousBitrixCursor,
+      yandexSyncCursor: previousYandexCursor,
+    });
+
+    const syncService = new SyncService(
+      sqliteService,
+      {
+        createEvent: async (_connectionId: string, draft: unknown) => createBitrixEvent({
+          description: (draft as { description?: string }).description ?? 'Description',
+          id: 'bitrix-created-from-yandex',
+          title: (draft as { title?: string }).title ?? 'Yandex event',
+        }),
+        listEventsSince: async () => {
+          throw new Error('QUERY_LIMIT_EXCEEDED');
+        },
+      } as never,
+      {
+        listEventResults: async () => [
+          { ok: true as const, value: createYandexEvent({ uid: 'yandex-new', url: 'https://caldav.yandex.ru/calendars/user/default/yandex-new.ics' }) },
+        ],
+      } as never,
+    );
+
+    const result = await syncService.runManualSyncNow(connection.id);
+    const state = sqliteService.getSyncState(connection.id);
+    const debugTrace = syncService.getDebugTrace(connection.id);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.processedYandexEvents, 1);
+    assert.equal(state.bitrixSyncCursor, previousBitrixCursor);
+    assert.notEqual(state.yandexSyncCursor, previousYandexCursor);
+    assert.equal(state.lastOutcomeReason, 'incremental_sync_completed_with_soft_failures');
+    assert.equal(debugTrace.trace?.summary.providerCallErrors.bitrix_list_events_failed, 1);
+    assert.equal(debugTrace.trace?.cursorDiagnostics.bitrix.note, 'bitrix_cursor_preserved_due_to_fetch_failure');
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test('recurring expected skip does not populate last error message', async () => {
+  const temp = makeTempDbPath('recurring-last-error');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const { connection } = setupReadyConnection(sqliteService);
+    const today = new Date();
+    const startsAt = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 12, 0, 0)).toISOString();
+    const endsAt = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 13, 0, 0)).toISOString();
+    const syncService = new SyncService(
+      sqliteService,
+      {
+        listEventsSince: async () => [createBitrixEvent({ endsAt, startsAt, id: 'bitrix-recurring-only', recurrenceRule: 'FREQ=DAILY;COUNT=2' })],
+      } as never,
+      {
+        listEventResults: async () => [],
+      } as never,
+    );
+
+    const result = await syncService.runManualSyncNow(connection.id);
+    const state = sqliteService.getSyncState(connection.id);
+
+    assert.equal(result.ok, true);
+    assert.equal(state.lastErrorMessage, null);
+    assert.equal(state.status, 'success');
+    assert.equal(state.lastSkippedRecurringEvents, 1);
+  } finally {
+    temp.cleanup();
+  }
+});
+
 test('sync service debug trace applies redaction and truncation markers for payload contract', () => {
   const temp = makeTempDbPath('debug-trace-redaction-truncation');
   try {
