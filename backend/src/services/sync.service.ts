@@ -87,6 +87,10 @@ export interface ManualSyncResult {
   status: SyncStatusResponse;
 }
 
+export interface ManualSyncOptions {
+  baselineDate?: string;
+}
+
 export interface PollingSchedule {
   maxDelayMs: number;
   minDelayMs: number;
@@ -162,7 +166,7 @@ interface SyncTraceItem {
 
 interface SyncDebugTrace {
   baseline: {
-    mode: 'today_plus_utc';
+    mode: 'fixed_day_utc' | 'today_plus_utc';
     startsAtGteUtc: string;
   };
   cursorDiagnostics: {
@@ -279,11 +283,11 @@ export class SyncService {
     };
   }
 
-  public async runManualResync(connectionId: string): Promise<ManualSyncResult> {
-    return this.runManualSyncNow(connectionId);
+  public async runManualResync(connectionId: string, options?: ManualSyncOptions): Promise<ManualSyncResult> {
+    return this.runManualSyncNow(connectionId, options);
   }
 
-  public async runManualSyncNow(connectionId: string): Promise<ManualSyncResult> {
+  public async runManualSyncNow(connectionId: string, options?: ManualSyncOptions): Promise<ManualSyncResult> {
     const context = this.requireContext(connectionId);
     const preflight = this.getExecutionPreflight('manual_sync', context.connection, context.installationReady);
     if (!preflight.allowed) {
@@ -300,7 +304,7 @@ export class SyncService {
       };
     }
 
-    const stats = await this.runSyncCycle(connectionId, 'manual_sync');
+    const stats = await this.runSyncCycle(connectionId, 'manual_sync', undefined, options);
     return {
       ok: true,
       message: 'Manual sync completed.',
@@ -387,12 +391,18 @@ export class SyncService {
     };
   }
 
-  private createDebugTrace(connectionId: string, trigger: SyncExecutionPath, startedAt: string, previousState: SyncState): SyncDebugTrace {
-    const baselineStart = this.getTodayBaselineStartUtc();
+  private createDebugTrace(
+    connectionId: string,
+    trigger: SyncExecutionPath,
+    startedAt: string,
+    previousState: SyncState,
+    options?: ManualSyncOptions,
+  ): SyncDebugTrace {
+    const baseline = this.resolveBaseline(options);
     return {
       baseline: {
-        mode: 'today_plus_utc',
-        startsAtGteUtc: baselineStart,
+        mode: baseline.mode,
+        startsAtGteUtc: baseline.startsAtGteUtc,
       },
       cursorDiagnostics: {
         bitrix: { after: null, before: previousState.bitrixSyncCursor, note: null },
@@ -439,6 +449,37 @@ export class SyncService {
   private getTodayBaselineStartUtc(): string {
     const now = new Date();
     return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+  }
+
+  private resolveBaseline(options?: ManualSyncOptions): SyncDebugTrace['baseline'] {
+    const baselineDate = options?.baselineDate?.trim();
+    if (!baselineDate || !/^\d{4}-\d{2}-\d{2}$/.test(baselineDate)) {
+      return {
+        mode: 'today_plus_utc',
+        startsAtGteUtc: this.getTodayBaselineStartUtc(),
+      };
+    }
+
+    const [yearRaw, monthRaw, dayRaw] = baselineDate.split('-');
+    const year = Number(yearRaw);
+    const month = Number(monthRaw);
+    const day = Number(dayRaw);
+    const utcDate = new Date(Date.UTC(year, month - 1, day));
+    if (
+      utcDate.getUTCFullYear() !== year
+      || utcDate.getUTCMonth() !== month - 1
+      || utcDate.getUTCDate() !== day
+    ) {
+      return {
+        mode: 'today_plus_utc',
+        startsAtGteUtc: this.getTodayBaselineStartUtc(),
+      };
+    }
+
+    return {
+      mode: 'fixed_day_utc',
+      startsAtGteUtc: utcDate.toISOString(),
+    };
   }
 
   private isBaselineEvent(startsAt: string | null, baselineStartUtc: string): boolean {
@@ -606,7 +647,12 @@ export class SyncService {
     }
   }
 
-  private async runSyncCycle(connectionId: string, trigger: SyncExecutionPath, webhookPayload?: Record<string, unknown>): Promise<SyncExecutionStats> {
+  private async runSyncCycle(
+    connectionId: string,
+    trigger: SyncExecutionPath,
+    webhookPayload?: Record<string, unknown>,
+    options?: ManualSyncOptions,
+  ): Promise<SyncExecutionStats> {
     if (this.connectionInFlight.has(connectionId)) {
       this.log('Skipping sync because connection is already in flight.', {
         connectionId,
@@ -644,7 +690,7 @@ export class SyncService {
 
     const previousState = this.sqliteService.getSyncState(connectionId);
     const startedAt = new Date().toISOString();
-    const trace = this.createDebugTrace(connectionId, trigger, startedAt, previousState);
+    const trace = this.createDebugTrace(connectionId, trigger, startedAt, previousState, options);
     this.connectionInFlight.add(connectionId);
     this.sqliteService.updateSyncState(connectionId, {
       activeDirection: trigger,

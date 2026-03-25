@@ -108,6 +108,36 @@ function resolveContext(sqliteService: SQLiteService, token: string): Connection
   return context;
 }
 
+function parseTargetDate(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return null;
+  }
+
+  const [yearRaw, monthRaw, dayRaw] = trimmed.split('-');
+  const year = Number(yearRaw);
+  const month = Number(monthRaw);
+  const day = Number(dayRaw);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    return null;
+  }
+
+  const candidate = new Date(Date.UTC(year, month - 1, day));
+  if (
+    candidate.getUTCFullYear() !== year
+    || candidate.getUTCMonth() !== month - 1
+    || candidate.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  return trimmed;
+}
+
 export function createOnboardingRouter(dependencies: OnboardingRouterDependencies): Router {
   const { sqliteService, syncService, yandexService, bitrixService } = dependencies;
   const router = Router();
@@ -186,7 +216,25 @@ export function createOnboardingRouter(dependencies: OnboardingRouterDependencie
   router.post('/:token/sync/run', async (request: Request, response: Response, next) => {
     try {
       const context = resolveContext(sqliteService, request.params.token);
-      const result = await syncService.runManualSyncNow(context.connection.id);
+      const payload = typeof request.body === 'object' && request.body ? request.body as Record<string, unknown> : {};
+      const hasTargetDate = Object.prototype.hasOwnProperty.call(payload, 'targetDate');
+      const targetDate = parseTargetDate(payload.targetDate);
+
+      if (hasTargetDate && !targetDate) {
+        response.status(400).json({
+          error: 'targetDate must be YYYY-MM-DD',
+          noop: true,
+          queued: false,
+          result: null,
+          reviewerEvidence: null,
+        });
+        return;
+      }
+
+      const result = await syncService.runManualSyncNow(
+        context.connection.id,
+        targetDate ? { baselineDate: targetDate } : undefined,
+      );
       response.status(200).json({
         error: null,
         noop: result.noop,
