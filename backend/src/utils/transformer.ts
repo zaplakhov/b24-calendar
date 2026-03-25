@@ -46,6 +46,10 @@ export interface EventAttendee {
   raw: string | null;
 }
 
+export interface EventReminder {
+  minutes: number;
+}
+
 export interface PreservedEventFields {
   deferredReasonCodes: string[];
   rawOrganizer: string | null;
@@ -70,6 +74,7 @@ export interface BitrixCalendarEvent {
   status: string | null;
   transparency: string | null;
   attendees: EventAttendee[];
+  reminders?: EventReminder[];
   preserved: PreservedEventFields;
   raw: Record<string, unknown>;
 }
@@ -85,6 +90,7 @@ export interface BitrixCalendarDraft {
   status?: string | null;
   transparency?: string | null;
   attendees?: EventAttendee[];
+  reminders?: EventReminder[];
   timezone?: string | null;
   preserved?: PreservedEventFields;
 }
@@ -105,6 +111,7 @@ export interface YandexCalendarEvent {
   status: string | null;
   transparency: string | null;
   attendees: EventAttendee[];
+  reminders?: EventReminder[];
   timezone: string | null;
   preserved: PreservedEventFields;
   rawIcs: string;
@@ -124,6 +131,7 @@ export interface YandexCalendarDraft {
   status: string | null;
   transparency: string | null;
   attendees: EventAttendee[];
+  reminders?: EventReminder[];
   timezone: string | null;
   preserved: PreservedEventFields;
 }
@@ -478,6 +486,47 @@ function parseAttendeesFromIcs(ics: string): EventAttendee[] {
   });
 }
 
+function parseRemindersFromIcs(ics: string): EventReminder[] {
+  const unfolded = normalizeIcsText(ics);
+  const blocks = [...unfolded.matchAll(/BEGIN:VALARM([\s\S]*?)END:VALARM/gi)];
+  const reminders: EventReminder[] = [];
+  for (const block of blocks) {
+    const payload = block[1] ?? '';
+    const triggerMatch = payload.match(/(?:^|\n)TRIGGER:?([^\n]+)/i);
+    if (!triggerMatch) {
+      continue;
+    }
+
+    const trigger = triggerMatch[1]?.trim() ?? '';
+    const minutesMatch = trigger.match(/^-PT(\d+)M$/i);
+    if (minutesMatch) {
+      const minutes = Number.parseInt(minutesMatch[1], 10);
+      if (Number.isFinite(minutes) && minutes > 0) {
+        reminders.push({ minutes });
+      }
+      continue;
+    }
+
+    const hoursMatch = trigger.match(/^-PT(\d+)H$/i);
+    if (hoursMatch) {
+      const hours = Number.parseInt(hoursMatch[1], 10);
+      if (Number.isFinite(hours) && hours > 0) {
+        reminders.push({ minutes: hours * 60 });
+      }
+    }
+  }
+
+  const unique = new Set<number>();
+  return reminders.filter((item) => {
+    if (unique.has(item.minutes)) {
+      return false;
+    }
+
+    unique.add(item.minutes);
+    return true;
+  });
+}
+
 function toRecord(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value ? value as Record<string, unknown> : {};
 }
@@ -646,6 +695,36 @@ function parseBitrixLocation(raw: Record<string, unknown>): string | null {
   return location;
 }
 
+function parseBitrixReminders(raw: Record<string, unknown>): EventReminder[] {
+  const source = Array.isArray(raw.REMIND) ? raw.REMIND : [];
+  const reminders: EventReminder[] = [];
+  for (const item of source) {
+    const payload = toRecord(item);
+    const type = typeof payload.type === 'string' ? payload.type.toLowerCase() : null;
+    if (type !== 'min') {
+      continue;
+    }
+
+    const countRaw = payload.count;
+    const minutes = typeof countRaw === 'number' ? countRaw : Number.parseInt(String(countRaw ?? ''), 10);
+    if (!Number.isFinite(minutes) || minutes <= 0) {
+      continue;
+    }
+
+    reminders.push({ minutes });
+  }
+
+  const unique = new Set<number>();
+  return reminders.filter((item) => {
+    if (unique.has(item.minutes)) {
+      return false;
+    }
+
+    unique.add(item.minutes);
+    return true;
+  });
+}
+
 function defaultPreservedFields(overrides?: Partial<PreservedEventFields>): PreservedEventFields {
   return {
     deferredReasonCodes: overrides?.deferredReasonCodes ?? [],
@@ -777,6 +856,16 @@ export function transformBitrixEventToYandexDraft(event: BitrixCalendarEvent): Y
     normalizeText(event.description),
     ...attendeeFallbackLines,
   ].filter((line): line is string => Boolean(line)).join('\n'));
+  const organizerFromAttendees = attendeesWithEmail.find((attendee) => normalizeIcsPartstat(attendee.partstat) === 'ACCEPTED') ?? attendeesWithEmail[0] ?? null;
+  const organizer = event.organizer?.email
+    ? event.organizer
+    : (organizerFromAttendees
+      ? {
+          email: organizerFromAttendees.email,
+          name: organizerFromAttendees.name,
+          raw: organizerFromAttendees.raw,
+        }
+      : null);
 
   return {
     uid: buildDeterministicUid(event.id),
@@ -788,10 +877,11 @@ export function transformBitrixEventToYandexDraft(event: BitrixCalendarEvent): Y
     recurrenceRule: normalizeText(event.recurrenceRule),
     sourceUpdatedAt: event.updatedAt ?? event.startsAt,
     location: event.location,
-    organizer: event.organizer,
+    organizer,
     status: event.status,
     transparency: event.transparency,
     attendees: attendeesWithEmail,
+    reminders: event.reminders ?? [],
     timezone: event.timezone ?? DEFAULT_TIMEZONE,
     preserved: defaultPreservedFields({
       ...event.preserved,
@@ -842,6 +932,13 @@ export function transformYandexEventToBitrixDraft(event: YandexCalendarEvent): B
     preserved.deferredReasonCodes.push('bitrix_attendees_deferred');
   }
 
+  if ((event.reminders ?? []).length > 0) {
+    preserved.deferredReasonCodes.push('bitrix_reminders_deferred');
+    for (const reminder of event.reminders ?? []) {
+      appendDeferredRawProperty(preserved, 'reminder', `min:${reminder.minutes}`);
+    }
+  }
+
   preserved.deferredReasonCodes = [...new Set(preserved.deferredReasonCodes)];
 
   return {
@@ -855,6 +952,7 @@ export function transformYandexEventToBitrixDraft(event: YandexCalendarEvent): B
     status: null,
     transparency: null,
     attendees: [],
+    reminders: [],
     timezone: null,
     preserved,
   };
@@ -863,6 +961,7 @@ export function transformYandexEventToBitrixDraft(event: YandexCalendarEvent): B
 export function buildYandexEventFingerprint(event: YandexCalendarEvent): string {
   return buildFingerprint({
     attendees: event.attendees,
+    reminders: event.reminders ?? [],
     description: event.description,
     endsAt: event.endsAt,
     isAllDay: event.isAllDay,
@@ -882,6 +981,7 @@ export function buildYandexEventFingerprint(event: YandexCalendarEvent): string 
 export function buildBitrixEventFingerprint(event: BitrixCalendarEvent): string {
   return buildFingerprint({
     attendees: event.attendees,
+    reminders: event.reminders ?? [],
     calendarId: event.calendarId,
     deleted: event.deleted,
     description: event.description,
@@ -911,7 +1011,7 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
     'VERSION:2.0',
     'PRODID:-//b24-calendar//MVP//EN',
     'CALSCALE:GREGORIAN',
-    'METHOD:PUBLISH',
+    draft.attendees.length > 0 ? 'METHOD:REQUEST' : 'METHOD:PUBLISH',
     'BEGIN:VEVENT',
     `UID:${escapeIcsValue(draft.uid)}`,
     'SEQUENCE:0',
@@ -950,6 +1050,18 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
     ].filter((item): item is string => Boolean(item));
     const prefix = params.length > 0 ? `;${params.join(';')}` : '';
     lines.push(`ATTENDEE${prefix}:mailto:${escapeIcsValue(attendee.email)}`);
+  }
+
+  for (const reminder of draft.reminders ?? []) {
+    if (!Number.isFinite(reminder.minutes) || reminder.minutes <= 0) {
+      continue;
+    }
+
+    lines.push('BEGIN:VALARM');
+    lines.push(`TRIGGER:-PT${Math.trunc(reminder.minutes)}M`);
+    lines.push('ACTION:DISPLAY');
+    lines.push('DESCRIPTION:Reminder');
+    lines.push('END:VALARM');
   }
 
   if (draft.recurrenceRule) {
@@ -1043,6 +1155,7 @@ export function parseYandexCalendarObject(rawIcs: string, url: string, etag: str
       status: normalizeText(extractIcsField(eventIcs, 'STATUS')),
       transparency: normalizeText(extractIcsField(eventIcs, 'TRANSP')),
       attendees: parseAttendeesFromIcs(eventIcs),
+      reminders: parseRemindersFromIcs(eventIcs),
       timezone,
       preserved: parsePreservedField(eventIcs),
       rawIcs,
@@ -1067,6 +1180,7 @@ export function buildBitrixEventFromRaw(payload: Record<string, unknown>): Bitri
   const organizerEmail = typeof payload.ORGANIZER_EMAIL === 'string' ? payload.ORGANIZER_EMAIL : null;
   const organizerName = typeof payload.ORGANIZER_NAME === 'string' ? payload.ORGANIZER_NAME : typeof payload.CREATED_BY_NAME === 'string' ? payload.CREATED_BY_NAME : null;
   const attendees = parseBitrixAttendees(payload);
+  const reminders = parseBitrixReminders(payload);
 
   return {
     id,
@@ -1092,6 +1206,7 @@ export function buildBitrixEventFromRaw(payload: Record<string, unknown>): Bitri
     status: typeof payload.STATUS === 'string' ? normalizeText(payload.STATUS) : null,
     transparency: typeof payload.TRANSP === 'string' ? normalizeText(payload.TRANSP) : null,
     attendees,
+    reminders,
     preserved: defaultPreservedFields({
       deferredReasonCodes: attendees.length > 0 ? ['bitrix_attendees_best_effort'] : [],
       rawAttendees: attendees,

@@ -187,6 +187,39 @@ test('transformer maps Bitrix attendee statuses to valid ICS PARTSTAT values', (
   assert.equal(map.get('declined@example.com'), 'DECLINED');
 });
 
+test('transformer emits METHOD:REQUEST and VALARM entries for attendees and reminders', () => {
+  const event = buildBitrixEventFromRaw({
+    ATTENDEE_LIST: [
+      { EMAIL: 'guest@example.com', NAME: 'Guest', status: 'Y' },
+    ],
+    DATE_FROM: '27.03.2026 14:45:00',
+    DATE_TO: '27.03.2026 15:45:00',
+    ID: 'attendee-reminder',
+    NAME: 'Attendee reminder event',
+    REMIND: [
+      { count: 15, type: 'min' },
+      { count: 60, type: 'min' },
+    ],
+    SECT_ID: 'calendar-1',
+    TZ_FROM: 'Europe/Moscow',
+  });
+
+  const ics = buildIcsEvent(transformBitrixEventToYandexDraft(event));
+  assert.match(ics, /METHOD:REQUEST/);
+  assert.match(ics, /ATTENDEE;CN=Guest;PARTSTAT=ACCEPTED:mailto:guest@example.com/);
+  assert.match(ics, /BEGIN:VALARM/);
+  assert.match(ics, /TRIGGER:-PT15M/);
+  assert.match(ics, /TRIGGER:-PT60M/);
+
+  const parsed = parseYandexCalendarObject(ics, 'https://caldav.yandex.ru/attendee-reminder.ics', 'etag-attendee-reminder');
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) {
+    return;
+  }
+
+  assert.deepEqual(parsed.value.reminders, [{ minutes: 15 }, { minutes: 60 }]);
+});
+
 test('transformer round-trips extended fields and all-day semantics through ICS', () => {
   const bitrixEvent = buildBitrixEventFromRaw({
     ATTENDEES: [{ EMAIL: 'guest@example.com', NAME: 'Guest', STATUS: 'ACCEPTED' }],
