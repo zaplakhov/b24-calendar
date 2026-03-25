@@ -447,32 +447,168 @@ function parseAttendeesFromIcs(ics: string): EventAttendee[] {
   });
 }
 
-function parseBitrixAttendees(raw: Record<string, unknown>): EventAttendee[] {
-  const source = raw.ATTENDEES ?? raw.attendees ?? raw.MEETING ?? [];
-  if (!Array.isArray(source)) {
-    return [];
+function toRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value ? value as Record<string, unknown> : {};
+}
+
+function parseBitrixAttendee(value: unknown): EventAttendee | null {
+  if (typeof value === 'string') {
+    const email = parseMailtoValue(value);
+    return email
+      ? {
+          email,
+          name: null,
+          partstat: null,
+          role: null,
+          raw: value,
+        }
+      : null;
   }
 
-  return source.map((item) => {
-    if (typeof item === 'string') {
-      return {
-        email: parseMailtoValue(item),
-        name: null,
-        partstat: null,
-        role: null,
-        raw: item,
-      };
+  const payload = toRecord(value);
+  const email = typeof payload.email === 'string'
+    ? parseMailtoValue(payload.email)
+    : typeof payload.EMAIL === 'string'
+      ? parseMailtoValue(payload.EMAIL)
+      : typeof payload.mail === 'string'
+        ? parseMailtoValue(payload.mail)
+        : typeof payload.MAIL === 'string'
+          ? parseMailtoValue(payload.MAIL)
+          : null;
+  const name = typeof payload.name === 'string'
+    ? normalizeText(payload.name)
+    : typeof payload.NAME === 'string'
+      ? normalizeText(payload.NAME)
+      : typeof payload.fullName === 'string'
+        ? normalizeText(payload.fullName)
+        : typeof payload.FULL_NAME === 'string'
+          ? normalizeText(payload.FULL_NAME)
+          : null;
+  const role = typeof payload.role === 'string'
+    ? normalizeText(payload.role)
+    : typeof payload.ROLE === 'string'
+      ? normalizeText(payload.ROLE)
+      : typeof payload.entityType === 'string'
+        ? normalizeText(payload.entityType)
+        : typeof payload.ENTITY_TYPE === 'string'
+          ? normalizeText(payload.ENTITY_TYPE)
+          : null;
+  const partstat = typeof payload.status === 'string'
+    ? normalizeText(payload.status)
+    : typeof payload.STATUS === 'string'
+      ? normalizeText(payload.STATUS)
+      : null;
+
+  if (!email) {
+    return null;
+  }
+
+  return {
+    email,
+    name,
+    partstat,
+    role,
+    raw: JSON.stringify(payload),
+  };
+}
+
+function parseBitrixAttendees(raw: Record<string, unknown>): EventAttendee[] {
+  const meetingPayload = toRecord(raw.MEETING);
+  const sources: unknown[] = [
+    raw.ATTENDEES,
+    raw.attendees,
+    raw.ATTENDEE_LIST,
+    raw.attendeesEntityList,
+    meetingPayload.ATTENDEE_LIST,
+    meetingPayload.attendeeList,
+    raw.MEETING,
+  ];
+
+  const parsed = sources
+    .flatMap((source) => (Array.isArray(source) ? source : []))
+    .map((item) => parseBitrixAttendee(item))
+    .filter((item): item is EventAttendee => Boolean(item));
+
+  const seen = new Set<string>();
+  return parsed.filter((attendee) => {
+    const key = attendee.email ?? `${attendee.name ?? ''}`;
+    if (seen.has(key)) {
+      return false;
     }
 
-    const payload = typeof item === 'object' && item ? item as Record<string, unknown> : {};
-    return {
-      email: typeof payload.email === 'string' ? parseMailtoValue(payload.email) : typeof payload.EMAIL === 'string' ? parseMailtoValue(payload.EMAIL) : null,
-      name: typeof payload.name === 'string' ? normalizeText(payload.name) : typeof payload.NAME === 'string' ? normalizeText(payload.NAME) : null,
-      partstat: typeof payload.status === 'string' ? normalizeText(payload.status) : typeof payload.STATUS === 'string' ? normalizeText(payload.STATUS) : null,
-      role: typeof payload.role === 'string' ? normalizeText(payload.role) : typeof payload.ROLE === 'string' ? normalizeText(payload.ROLE) : null,
-      raw: JSON.stringify(payload),
-    };
+    seen.add(key);
+    return true;
   });
+}
+
+function parseBitrixLocation(raw: Record<string, unknown>): string | null {
+  const location = typeof raw.LOCATION === 'string'
+    ? normalizeText(raw.LOCATION)
+    : typeof raw.location === 'string'
+      ? normalizeText(raw.location)
+      : null;
+  if (!location) {
+    return null;
+  }
+
+  const meetingPayload = toRecord(raw.MEETING);
+  const meetingLocation = typeof meetingPayload.LOCATION === 'string'
+    ? normalizeText(meetingPayload.LOCATION)
+    : typeof meetingPayload.location === 'string'
+      ? normalizeText(meetingPayload.location)
+      : typeof meetingPayload.ROOM_NAME === 'string'
+        ? normalizeText(meetingPayload.ROOM_NAME)
+        : typeof meetingPayload.roomName === 'string'
+          ? normalizeText(meetingPayload.roomName)
+          : null;
+  if (meetingLocation && !/^calendar_\d+_\d+$/i.test(meetingLocation)) {
+    return meetingLocation;
+  }
+
+  const locationMatch = location.match(/^calendar_\d+_(\d+)$/i);
+  if (!locationMatch) {
+    return location;
+  }
+
+  const targetId = locationMatch[1];
+  const candidateSources = [raw.ATTENDEE_LIST, raw.attendeesEntityList, meetingPayload.ATTENDEE_LIST, meetingPayload.attendeeList]
+    .flatMap((source) => (Array.isArray(source) ? source : []));
+  for (const candidateRaw of candidateSources) {
+    const candidate = toRecord(candidateRaw);
+    const ids = [
+      candidate.ID,
+      candidate.id,
+      candidate.ENTITY_ID,
+      candidate.entityId,
+      candidate.CALENDAR_ID,
+      candidate.calendarId,
+      candidate.RESOURCE_ID,
+      candidate.resourceId,
+    ].map((value) => (value == null ? null : String(value)));
+    const compoundIds = [candidate.CODE, candidate.code].map((value) => (value == null ? null : String(value)));
+    if (!ids.includes(targetId) && !compoundIds.includes(location)) {
+      continue;
+    }
+
+    const displayName = typeof candidate.DISPLAY_NAME === 'string'
+      ? normalizeText(candidate.DISPLAY_NAME)
+      : typeof candidate.displayName === 'string'
+        ? normalizeText(candidate.displayName)
+        : typeof candidate.NAME === 'string'
+          ? normalizeText(candidate.NAME)
+          : typeof candidate.name === 'string'
+            ? normalizeText(candidate.name)
+            : typeof candidate.TITLE === 'string'
+              ? normalizeText(candidate.TITLE)
+              : typeof candidate.title === 'string'
+                ? normalizeText(candidate.title)
+                : null;
+    if (displayName) {
+      return displayName;
+    }
+  }
+
+  return location;
 }
 
 function defaultPreservedFields(overrides?: Partial<PreservedEventFields>): PreservedEventFields {
@@ -868,6 +1004,9 @@ export function parseYandexCalendarObject(rawIcs: string, url: string, etag: str
 export function buildBitrixEventFromRaw(payload: Record<string, unknown>): BitrixCalendarEvent {
   const id = String(payload.ID ?? payload.id ?? '');
   const sourceTimezone = payload.TZ_FROM ? String(payload.TZ_FROM) : payload.timezone ? String(payload.timezone) : DEFAULT_TIMEZONE;
+  const description = (typeof payload.DESCRIPTION === 'string' ? normalizeText(payload.DESCRIPTION) : null)
+    ?? (typeof payload.description === 'string' ? normalizeText(payload.description) : null)
+    ?? (typeof payload['~DESCRIPTION'] === 'string' ? normalizeText(payload['~DESCRIPTION']) : null);
   const startsAt = parseBitrixDate(
     typeof payload.DATE_FROM === 'string' ? payload.DATE_FROM : typeof payload.dateFrom === 'string' ? payload.dateFrom : typeof payload.from === 'string' ? payload.from : null,
     sourceTimezone,
@@ -884,7 +1023,7 @@ export function buildBitrixEventFromRaw(payload: Record<string, unknown>): Bitri
     id,
     calendarId: payload.SECT_ID ? String(payload.SECT_ID) : payload.sectionId ? String(payload.sectionId) : null,
     title: String(payload.NAME ?? payload.name ?? 'Untitled Bitrix event'),
-    description: payload.DESCRIPTION ? String(payload.DESCRIPTION) : payload.description ? String(payload.description) : null,
+    description,
     startsAt,
     endsAt,
     timezone: sourceTimezone,
@@ -893,7 +1032,7 @@ export function buildBitrixEventFromRaw(payload: Record<string, unknown>): Bitri
       ?? parseBitrixUtcTimestamp(payload.TIMESTAMP_X_TS_UTC ?? payload.updatedAtTsUtc),
     deleted: false,
     recurrenceRule: payload.RRULE ? String(payload.RRULE) : payload.rrule ? String(payload.rrule) : null,
-    location: typeof payload.LOCATION === 'string' ? normalizeText(payload.LOCATION) : typeof payload.location === 'string' ? normalizeText(payload.location) : null,
+    location: parseBitrixLocation(payload),
     organizer: organizerEmail || organizerName
       ? {
           email: parseMailtoValue(organizerEmail),

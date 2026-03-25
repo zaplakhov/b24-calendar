@@ -31,7 +31,7 @@ import {
   type YandexCalendarEvent,
 } from '../utils/transformer';
 import { BitrixService } from './bitrix.service';
-import { SQLiteService, type ConnectionSettings, type SyncRunObservability, type SyncState } from './sqlite.service';
+import { SQLiteService, type ConnectionSettings, type EventMappingRecord, type SyncRunObservability, type SyncState } from './sqlite.service';
 import { YandexCalDavService, YandexCalendarNormalizationError, YandexCalendarObjectNotFoundError } from './yandex-caldav.service';
 import {
   sanitizeAndTruncateTracePayload,
@@ -215,6 +215,8 @@ interface SyncRunObservabilityAccumulator {
 }
 
 export class SyncService {
+  private static readonly YANDEX_ECHO_SUPPRESSION_WINDOW_MS = 2 * 60 * 1000;
+
   private pollingTimer: NodeJS.Timeout | null = null;
   private schedulerInFlight = false;
   private readonly connectionInFlight = new Set<string>();
@@ -527,6 +529,23 @@ export class SyncService {
       yandexEventUid: mapping.yandexEventUid,
       yandexEventUrl: mapping.yandexEventUrl,
     };
+  }
+
+  private shouldSuppressYandexEcho(mapping: EventMappingRecord | null, decisionReason: string, decisionAction: string): boolean {
+    if (!mapping || decisionAction !== 'update' || decisionReason !== 'source_newer_or_tiebreaker') {
+      return false;
+    }
+
+    if (mapping.lastWinner !== 'bitrix' || !mapping.lastSyncedAt) {
+      return false;
+    }
+
+    const syncedAtMs = Date.parse(mapping.lastSyncedAt);
+    if (Number.isNaN(syncedAtMs)) {
+      return false;
+    }
+
+    return Date.now() - syncedAtMs <= SyncService.YANDEX_ECHO_SUPPRESSION_WINDOW_MS;
   }
 
   private appendTraceItem(trace: SyncDebugTrace, item: SyncTraceItem): void {
@@ -1553,24 +1572,30 @@ export class SyncService {
       sourceVersion: event.etag ?? event.uid ?? event.url,
       targetPresent: Boolean(mapping?.bitrixEventId),
     });
+    const effectiveDecision = this.shouldSuppressYandexEcho(mapping, decision.reason, decision.action)
+      ? { action: 'skip' as const, reason: 'echo_suppressed_recent_remote_write' }
+      : decision;
 
-    this.sqliteService.updateSyncState(connectionId, { lastOutcomeReason: decision.reason });
+    this.sqliteService.updateSyncState(connectionId, { lastOutcomeReason: effectiveDecision.reason });
     traceItem.decision = {
-      action: decision.action,
-      explanation: 'Conflict resolver selected sync action for Yandex source event.',
-      reason: decision.reason,
+      action: effectiveDecision.action,
+      explanation: effectiveDecision.reason === 'echo_suppressed_recent_remote_write'
+        ? 'Recent Bitrix-origin write detected; suppressed immediate Yandex echo update.'
+        : 'Conflict resolver selected sync action for Yandex source event.',
+      reason: effectiveDecision.reason,
     };
-    this.incrementTraceReason(trace, decision.reason);
+    this.incrementTraceReason(trace, effectiveDecision.reason);
     syncDebug({
       connectionId,
-      decision,
+      decision: effectiveDecision,
+      decisionOriginal: decision,
       mapping,
       phase: 'sync.yandexEvent.decision',
       uid: event.uid,
       url: event.url,
     });
 
-    if (decision.action === 'skip') {
+    if (effectiveDecision.action === 'skip') {
       traceItem.mutation = {
         errorClass: null,
         executedAction: 'none',
@@ -1589,7 +1614,7 @@ export class SyncService {
       uid: event.uid,
       url: event.url,
     });
-    const syncedEvent = decision.action === 'update' && mapping?.bitrixEventId
+    const syncedEvent = effectiveDecision.action === 'update' && mapping?.bitrixEventId
       ? await this.bitrixService.updateEvent(connectionId, mapping.bitrixEventId, draft)
       : await this.bitrixService.createEvent(connectionId, draft);
 
@@ -1609,7 +1634,7 @@ export class SyncService {
       deletedAt: null,
       deletedBy: null,
       healingUrl: mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url ? mapping.yandexEventUrl : null,
-      lastDecisionReason: decision.reason,
+      lastDecisionReason: effectiveDecision.reason,
       lastHealedAt: mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url ? new Date().toISOString() : mapping?.lastHealedAt ?? null,
       lastHealingReason: mapping?.yandexEventUrl && mapping.yandexEventUrl !== event.url ? 'yandex_url_rebound' : mapping?.lastHealingReason ?? null,
       lastSyncedAt: new Date().toISOString(),
@@ -1631,8 +1656,8 @@ export class SyncService {
 
     traceItem.mutation = {
       errorClass: null,
-      executedAction: decision.action === 'update' ? 'update_target' : 'create_target',
-      intendedAction: decision.action,
+      executedAction: effectiveDecision.action === 'update' ? 'update_target' : 'create_target',
+      intendedAction: effectiveDecision.action,
       outcome: 'executed',
     };
     traceItem.mappingDelta = {

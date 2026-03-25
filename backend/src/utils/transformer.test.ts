@@ -75,6 +75,50 @@ test('transformer falls back to Bitrix *_TS_UTC values for invalid date strings'
   assert.equal(result.ok, true);
 });
 
+test('transformer parses Bitrix attendees from ATTENDEE_LIST and attendeesEntityList', () => {
+  const event = buildBitrixEventFromRaw({
+    ATTENDEE_LIST: [
+      { EMAIL: 'alice@example.com', NAME: 'Alice', STATUS: 'accepted' },
+      { EMAIL: 'bob@example.com', NAME: 'Bob', STATUS: 'tentative' },
+    ],
+    DATE_FROM: '27.03.2026 10:00:00',
+    DATE_TO: '27.03.2026 11:00:00',
+    ID: 'attendees-from-list',
+    NAME: 'Attendees test',
+    SECT_ID: 'calendar-1',
+    TZ_FROM: 'Europe/Moscow',
+    attendeesEntityList: [
+      { EMAIL: 'alice@example.com', NAME: 'Alice' },
+      { EMAIL: 'bob@example.com', NAME: 'Bob' },
+    ],
+  });
+
+  assert.equal(event.attendees.length, 2);
+  assert.equal(event.attendees[0]?.email, 'alice@example.com');
+  assert.equal(event.attendees[1]?.email, 'bob@example.com');
+  assert.equal(event.attendees[0]?.name, 'Alice');
+});
+
+test('transformer resolves human-readable Bitrix location from attendeesEntityList', () => {
+  const event = buildBitrixEventFromRaw({
+    ATTENDEE_LIST: [
+      { CALENDAR_ID: '14355', NAME: 'Переговорка 7A' },
+    ],
+    DATE_FROM: '27.03.2026 10:00:00',
+    DATE_TO: '27.03.2026 11:00:00',
+    ID: 'location-readable',
+    LOCATION: 'calendar_3_14355',
+    NAME: 'Location test',
+    SECT_ID: 'calendar-1',
+    TZ_FROM: 'Europe/Moscow',
+    attendeesEntityList: [
+      { ID: '14355', NAME: 'Переговорка 7A' },
+    ],
+  });
+
+  assert.equal(event.location, 'Переговорка 7A');
+});
+
 test('transformer round-trips extended fields and all-day semantics through ICS', () => {
   const bitrixEvent = buildBitrixEventFromRaw({
     ATTENDEES: [{ EMAIL: 'guest@example.com', NAME: 'Guest', STATUS: 'ACCEPTED' }],

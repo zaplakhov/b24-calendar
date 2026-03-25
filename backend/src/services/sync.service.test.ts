@@ -260,6 +260,58 @@ test('sync service processes Bitrix local datetime payloads without invalid-date
   }
 });
 
+test('sync service sends Bitrix description, location, and attendees to Yandex draft', async () => {
+  const temp = makeTempDbPath('bitrix-fields-to-yandex');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const { connection } = setupReadyConnection(sqliteService);
+    let capturedDraft: { attendees?: unknown[]; description?: string | null; location?: string | null } | null = null;
+    const sourceEvent = buildBitrixEventFromRaw({
+      ATTENDEE_LIST: [
+        { EMAIL: 'alice@example.com', NAME: 'Alice', STATUS: 'accepted' },
+        { EMAIL: 'bob@example.com', NAME: 'Bob', STATUS: 'tentative' },
+      ],
+      DATE_FROM: '27.03.2026 10:00:00',
+      DATE_TO: '27.03.2026 11:00:00',
+      DESCRIPTION: '',
+      ID: 'bitrix-rich-fields',
+      LOCATION: 'calendar_3_14355',
+      NAME: 'Rich fields event',
+      SECT_ID: '42',
+      TZ_FROM: 'Europe/Moscow',
+      attendeesEntityList: [{ ID: '14355', NAME: 'Переговорка 7A' }],
+      '~DESCRIPTION': 'описание из ~DESCRIPTION',
+    });
+
+    const syncService = new SyncService(
+      sqliteService,
+      {
+        deleteEvent: async () => undefined,
+        listEventsSince: async () => [sourceEvent],
+      } as never,
+      {
+        createEvent: async (_connectionId: string, draft: unknown) => {
+          capturedDraft = draft as { attendees?: unknown[]; description?: string | null; location?: string | null };
+          return createYandexEvent({ uid: 'uid-rich-fields', url: 'https://caldav.yandex.ru/calendars/user/default/rich-fields.ics' });
+        },
+        listEventResults: async () => [],
+      } as never,
+    );
+
+    const result = await syncService.runManualSyncNow(connection.id);
+
+    assert.equal(result.ok, true);
+    assert.ok(capturedDraft);
+    const draft = capturedDraft as { attendees?: unknown[]; description?: string | null; location?: string | null };
+    assert.equal(draft.description, 'описание из ~DESCRIPTION');
+    assert.equal(draft.location, 'Переговорка 7A');
+    assert.equal(Array.isArray(draft.attendees), true);
+    assert.equal(draft.attendees?.length, 2);
+  } finally {
+    temp.cleanup();
+  }
+});
+
 test('sync service heals stale Yandex mappings by uid and rewrites mapping metadata', async () => {
   const temp = makeTempDbPath('stale-healing');
   try {
@@ -509,6 +561,74 @@ test('sync service preserves deferred Yandex -> Bitrix fields in inbound mapping
         },
       },
     });
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test('sync service suppresses immediate Yandex echo updates after Bitrix-origin write', async () => {
+  const temp = makeTempDbPath('yandex-echo-suppression');
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const { connection } = setupReadyConnection(sqliteService);
+    const bitrixUpdatedAt = '2026-03-25T10:25:06.000Z';
+    const yandexEvent = createYandexEvent({
+      description: 'Echo payload from yandex',
+      etag: 'etag-echo-2',
+      startsAt: '2026-03-27T13:00:00.000Z',
+      endsAt: '2026-03-27T14:00:00.000Z',
+      uid: 'uid-echo',
+      updatedAt: '2026-03-25T10:25:07.000Z',
+      url: 'https://caldav.yandex.ru/calendars/user/default/echo.ics',
+    });
+    sqliteService.upsertEventMapping({
+      bitrixEventId: 'bitrix-echo-1',
+      bitrixUpdatedAt,
+      connectionId: connection.id,
+      deferredReasonCodes: [],
+      deletedAt: null,
+      deletedBy: null,
+      healingUrl: null,
+      lastDecisionReason: 'source_newer_or_tiebreaker',
+      lastHealedAt: null,
+      lastHealingReason: null,
+      lastSyncedAt: new Date().toISOString(),
+      lastWinner: 'bitrix',
+      preservedPayload: null,
+      sourceFingerprint: 'bitrix-fingerprint',
+      sourceTimezone: 'Europe/Moscow',
+      status: 'synced',
+      targetFingerprint: 'outdated-target-fingerprint',
+      targetTimezone: 'UTC',
+      yandexEventEtag: 'etag-echo-1',
+      yandexEventUid: yandexEvent.uid,
+      yandexEventUrl: yandexEvent.url,
+      yandexUpdatedAt: '2026-03-25T10:25:05.000Z',
+    });
+
+    let bitrixUpdateCalls = 0;
+    const syncService = new SyncService(
+      sqliteService,
+      {
+        deleteEvent: async () => undefined,
+        listEventsSince: async () => [],
+        updateEvent: async () => {
+          bitrixUpdateCalls += 1;
+          return createBitrixEvent({ id: 'bitrix-echo-1' });
+        },
+      } as never,
+      {
+        listEventResults: async () => [{ ok: true as const, value: yandexEvent }],
+      } as never,
+    );
+
+    const result = await syncService.runManualSyncNow(connection.id);
+    const debugTrace = syncService.getDebugTrace(connection.id);
+
+    assert.equal(result.ok, true);
+    assert.equal(bitrixUpdateCalls, 0);
+    assert.equal(result.status.state.lastOutcomeReason, 'incremental_sync_completed');
+    assert.ok((debugTrace.trace?.trail ?? []).some((item) => item.decision?.reason === 'echo_suppressed_recent_remote_write'));
   } finally {
     temp.cleanup();
   }
