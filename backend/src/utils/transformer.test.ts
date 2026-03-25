@@ -42,6 +42,39 @@ test('transformer skips Bitrix sentinel dates without fallback to now', () => {
   assert.equal(event.startsAt, '');
 });
 
+test('transformer parses Bitrix local datetime format with timezone', () => {
+  const event = buildBitrixEventFromRaw({
+    DATE_FROM: '27.03.2026 10:00:00',
+    DATE_TO: '27.03.2026 11:00:00',
+    ID: 'local-format',
+    NAME: 'Local format',
+    SECT_ID: 'calendar-1',
+    TZ_FROM: 'Europe/Moscow',
+  });
+
+  assert.equal(event.startsAt, '2026-03-27T07:00:00.000Z');
+  assert.equal(event.endsAt, '2026-03-27T08:00:00.000Z');
+  const result = normalizeBitrixEventForSync(event, 'calendar-1');
+  assert.equal(result.ok, true);
+});
+
+test('transformer falls back to Bitrix *_TS_UTC values for invalid date strings', () => {
+  const event = buildBitrixEventFromRaw({
+    DATE_FROM: '',
+    DATE_FROM_TS_UTC: '1715166000',
+    DATE_TO: null,
+    DATE_TO_TS_UTC: '1715167800',
+    ID: 'ts-fallback',
+    NAME: 'Fallback format',
+    SECT_ID: 'calendar-1',
+  });
+
+  assert.equal(event.startsAt, '2024-05-08T11:00:00.000Z');
+  assert.equal(event.endsAt, '2024-05-08T11:30:00.000Z');
+  const result = normalizeBitrixEventForSync(event, 'calendar-1');
+  assert.equal(result.ok, true);
+});
+
 test('transformer round-trips extended fields and all-day semantics through ICS', () => {
   const bitrixEvent = buildBitrixEventFromRaw({
     ATTENDEES: [{ EMAIL: 'guest@example.com', NAME: 'Guest', STATUS: 'ACCEPTED' }],

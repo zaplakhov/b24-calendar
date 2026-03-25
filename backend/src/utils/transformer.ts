@@ -332,7 +332,7 @@ function isIsoDateSupported(value: string): boolean {
   return !Number.isNaN(parsed.valueOf()) && parsed.getUTCFullYear() >= SENTINEL_YEAR_THRESHOLD;
 }
 
-function parseBitrixDate(value: string | null | undefined): string | null {
+function parseBitrixDate(value: string | null | undefined, timezone?: string | null): string | null {
   const normalized = normalizeText(value);
   if (!normalized) {
     return null;
@@ -340,10 +340,32 @@ function parseBitrixDate(value: string | null | undefined): string | null {
 
   const parsed = new Date(normalized);
   if (Number.isNaN(parsed.valueOf()) || parsed.getUTCFullYear() < SENTINEL_YEAR_THRESHOLD) {
-    return null;
+    const localDateMatch = normalized.match(/^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+    if (!localDateMatch) {
+      return null;
+    }
+
+    const [, day, month, year, hour = '00', minute = '00', second = '00'] = localDateMatch;
+    const iso = convertLocalIcsDateToUtc(`${year}${month}${day}T${hour}${minute}${second}`, timezone ?? DEFAULT_TIMEZONE);
+    return iso && isIsoDateSupported(iso) ? iso : null;
   }
 
   return parsed.toISOString();
+}
+
+function parseBitrixUtcTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    return null;
+  }
+
+  const numeric = typeof value === 'number' ? value : Number.parseInt(value, 10);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+
+  const timestampMs = Math.abs(numeric) >= 1_000_000_000_000 ? numeric : numeric * 1000;
+  const parsed = new Date(timestampMs);
+  return isIsoDateSupported(parsed.toISOString()) ? parsed.toISOString() : null;
 }
 
 function parseIcsDate(value: string | null, timezone: string | null): { isAllDay: boolean; iso: string } | null {
@@ -845,8 +867,15 @@ export function parseYandexCalendarObject(rawIcs: string, url: string, etag: str
 
 export function buildBitrixEventFromRaw(payload: Record<string, unknown>): BitrixCalendarEvent {
   const id = String(payload.ID ?? payload.id ?? '');
-  const startsAt = parseBitrixDate(typeof payload.DATE_FROM === 'string' ? payload.DATE_FROM : typeof payload.dateFrom === 'string' ? payload.dateFrom : typeof payload.from === 'string' ? payload.from : null) ?? '';
-  const endsAt = parseBitrixDate(typeof payload.DATE_TO === 'string' ? payload.DATE_TO : typeof payload.dateTo === 'string' ? payload.dateTo : typeof payload.to === 'string' ? payload.to : null) ?? '';
+  const sourceTimezone = payload.TZ_FROM ? String(payload.TZ_FROM) : payload.timezone ? String(payload.timezone) : DEFAULT_TIMEZONE;
+  const startsAt = parseBitrixDate(
+    typeof payload.DATE_FROM === 'string' ? payload.DATE_FROM : typeof payload.dateFrom === 'string' ? payload.dateFrom : typeof payload.from === 'string' ? payload.from : null,
+    sourceTimezone,
+  ) ?? parseBitrixUtcTimestamp(payload.DATE_FROM_TS_UTC ?? payload.dateFromTsUtc) ?? '';
+  const endsAt = parseBitrixDate(
+    typeof payload.DATE_TO === 'string' ? payload.DATE_TO : typeof payload.dateTo === 'string' ? payload.dateTo : typeof payload.to === 'string' ? payload.to : null,
+    sourceTimezone,
+  ) ?? parseBitrixUtcTimestamp(payload.DATE_TO_TS_UTC ?? payload.dateToTsUtc) ?? '';
   const organizerEmail = typeof payload.ORGANIZER_EMAIL === 'string' ? payload.ORGANIZER_EMAIL : null;
   const organizerName = typeof payload.ORGANIZER_NAME === 'string' ? payload.ORGANIZER_NAME : typeof payload.CREATED_BY_NAME === 'string' ? payload.CREATED_BY_NAME : null;
   const attendees = parseBitrixAttendees(payload);
@@ -858,9 +887,10 @@ export function buildBitrixEventFromRaw(payload: Record<string, unknown>): Bitri
     description: payload.DESCRIPTION ? String(payload.DESCRIPTION) : payload.description ? String(payload.description) : null,
     startsAt,
     endsAt,
-    timezone: payload.TZ_FROM ? String(payload.TZ_FROM) : payload.timezone ? String(payload.timezone) : DEFAULT_TIMEZONE,
+    timezone: sourceTimezone,
     isAllDay: String(payload.SKIP_TIME ?? payload.skipTime ?? 'N').toUpperCase() === 'Y',
-    updatedAt: parseBitrixDate(payload.TIMESTAMP_X ? String(payload.TIMESTAMP_X) : payload.updatedAt ? String(payload.updatedAt) : null),
+    updatedAt: parseBitrixDate(payload.TIMESTAMP_X ? String(payload.TIMESTAMP_X) : payload.updatedAt ? String(payload.updatedAt) : null, sourceTimezone)
+      ?? parseBitrixUtcTimestamp(payload.TIMESTAMP_X_TS_UTC ?? payload.updatedAtTsUtc),
     deleted: false,
     recurrenceRule: payload.RRULE ? String(payload.RRULE) : payload.rrule ? String(payload.rrule) : null,
     location: typeof payload.LOCATION === 'string' ? normalizeText(payload.LOCATION) : typeof payload.location === 'string' ? normalizeText(payload.location) : null,

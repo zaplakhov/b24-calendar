@@ -30,7 +30,7 @@ import Database from 'better-sqlite3';
 import { SQLiteService } from './sqlite.service';
 import { SyncService } from './sync.service';
 import { YandexCalendarObjectNotFoundError } from './yandex-caldav.service';
-import { buildYandexEventFingerprint, type BitrixCalendarEvent, type YandexCalendarEvent } from '../utils/transformer';
+import { buildBitrixEventFromRaw, buildYandexEventFingerprint, type BitrixCalendarEvent, type YandexCalendarEvent } from '../utils/transformer';
 
 function makeTempDbPath(name: string): { cleanup: () => void; dbPath: string } {
   const dir = mkdtempSync(join(tmpdir(), `b24-calendar-${name}-`));
@@ -197,6 +197,63 @@ test('sync service soft-skips out-of-scope and invalid Bitrix events while proce
     assert.equal(result.status.state.lastOutcomeReason, 'incremental_sync_completed');
     assert.match(JSON.stringify(logEntries), /bitrix_event_out_of_scope/);
     assert.match(JSON.stringify(logEntries), /bitrix_invalid_dates/);
+  } finally {
+    console.warn = originalWarn;
+    temp.cleanup();
+  }
+});
+
+test('sync service processes Bitrix local datetime payloads without invalid-date skip', async () => {
+  const temp = makeTempDbPath('bitrix-local-datetime-format');
+  const logEntries: unknown[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { logEntries.push(args); };
+
+  try {
+    const sqliteService = new SQLiteService(temp.dbPath);
+    const { connection } = setupReadyConnection(sqliteService);
+    const createdEvents: YandexCalendarEvent[] = [];
+    const sourceEvent = buildBitrixEventFromRaw({
+      DATE_FROM: '27.03.2026 10:00:00',
+      DATE_TO: '27.03.2026 11:00:00',
+      ID: 'bitrix-local-1',
+      NAME: 'Local format event',
+      SECT_ID: '42',
+      TIMESTAMP_X: '27.03.2026 09:30:00',
+      TZ_FROM: 'Europe/Moscow',
+      TZ_TO: 'Europe/Moscow',
+    });
+
+    const syncService = new SyncService(
+      sqliteService,
+      {
+        deleteEvent: async () => undefined,
+        listEventsSince: async () => [sourceEvent],
+      } as never,
+      {
+        createEvent: async (_connectionId: string, draft: unknown) => {
+          const payload = draft as { startsAt: string; endsAt: string };
+          const event = createYandexEvent({
+            endsAt: payload.endsAt,
+            startsAt: payload.startsAt,
+            uid: 'uid-local-format',
+            url: 'https://caldav.yandex.ru/calendars/user/default/local-format.ics',
+          });
+          createdEvents.push(event);
+          return event;
+        },
+        listEventResults: async () => [],
+      } as never,
+    );
+
+    const result = await syncService.runManualSyncNow(connection.id);
+
+    assert.equal(result.ok, true);
+    assert.equal(createdEvents.length, 1);
+    assert.equal(createdEvents[0]?.startsAt, '2026-03-27T07:00:00.000Z');
+    assert.equal(createdEvents[0]?.endsAt, '2026-03-27T08:00:00.000Z');
+    assert.equal(sqliteService.listEventMappings(connection.id).length, 1);
+    assert.doesNotMatch(JSON.stringify(logEntries), /bitrix_invalid_dates/);
   } finally {
     console.warn = originalWarn;
     temp.cleanup();
