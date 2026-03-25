@@ -284,6 +284,19 @@ export class BitrixService {
       }
     }
 
+    const attendeeCodes = Array.isArray(raw.ATTENDEES_CODES) ? raw.ATTENDEES_CODES : [];
+    for (const code of attendeeCodes) {
+      if (typeof code !== 'string') {
+        continue;
+      }
+
+      const normalized = code.trim().toUpperCase();
+      const userMatch = normalized.match(/^U(\d+)$/);
+      if (userMatch) {
+        ids.add(userMatch[1]);
+      }
+    }
+
     return [...ids];
   }
 

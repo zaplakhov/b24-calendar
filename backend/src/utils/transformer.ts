@@ -1045,7 +1045,10 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
     const partstat = normalizeIcsPartstat(attendee.partstat);
     const params = [
       attendee.name ? `CN=${escapeIcsValue(attendee.name)}` : null,
+      'CUTYPE=INDIVIDUAL',
       attendee.role ? `ROLE=${escapeIcsValue(attendee.role)}` : null,
+      'RSVP=TRUE',
+      'SCHEDULE-AGENT=CLIENT',
       partstat ? `PARTSTAT=${escapeIcsValue(partstat)}` : null,
     ].filter((item): item is string => Boolean(item));
     const prefix = params.length > 0 ? `;${params.join(';')}` : '';

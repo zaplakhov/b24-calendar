@@ -206,7 +206,7 @@ test('transformer emits METHOD:REQUEST and VALARM entries for attendees and remi
 
   const ics = buildIcsEvent(transformBitrixEventToYandexDraft(event));
   assert.match(ics, /METHOD:REQUEST/);
-  assert.match(ics, /ATTENDEE;CN=Guest;PARTSTAT=ACCEPTED:mailto:guest@example.com/);
+  assert.match(ics, /ATTENDEE;CN=Guest;CUTYPE=INDIVIDUAL;RSVP=TRUE;SCHEDULE-AGENT=CLIENT;PARTSTAT=ACCEPTED:mailto:guest@example.com/);
   assert.match(ics, /BEGIN:VALARM/);
   assert.match(ics, /TRIGGER:-PT15M/);
   assert.match(ics, /TRIGGER:-PT60M/);
