@@ -119,6 +119,46 @@ test('transformer resolves human-readable Bitrix location from attendeesEntityLi
   assert.equal(event.location, 'Переговорка 7A');
 });
 
+test('transformer preserves multiline description when building ICS', () => {
+  const bitrixEvent = buildBitrixEventFromRaw({
+    DATE_FROM: '2026-03-27T10:00:00Z',
+    DATE_TO: '2026-03-27T11:00:00Z',
+    DESCRIPTION: 'строка 1\r\nстрока 2\nстрока 3',
+    ID: 'multiline-description',
+    NAME: 'Multiline description',
+    SECT_ID: 'calendar-1',
+  });
+
+  const draft = transformBitrixEventToYandexDraft(bitrixEvent);
+  const parsed = parseYandexCalendarObject(buildIcsEvent(draft), 'https://caldav.yandex.ru/multiline.ics', 'etag-multiline');
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) {
+    return;
+  }
+
+  assert.equal(parsed.value.description, 'строка 1\nстрока 2\nстрока 3');
+});
+
+test('transformer appends attendee fallback line when email is missing', () => {
+  const bitrixEvent = buildBitrixEventFromRaw({
+    ATTENDEE_LIST: [
+      { EMAIL: 'with-email@example.com', NAME: 'With Email' },
+      { NAME: 'Без почты' },
+    ],
+    DATE_FROM: '2026-03-27T10:00:00Z',
+    DATE_TO: '2026-03-27T11:00:00Z',
+    DESCRIPTION: 'Базовое описание',
+    ID: 'attendee-fallback',
+    NAME: 'Attendee fallback',
+    SECT_ID: 'calendar-1',
+  });
+
+  const draft = transformBitrixEventToYandexDraft(bitrixEvent);
+  assert.equal(draft.attendees.length, 1);
+  assert.equal(draft.attendees[0]?.email, 'with-email@example.com');
+  assert.equal(draft.description, 'Базовое описание\nУчастник: Без почты');
+});
+
 test('transformer round-trips extended fields and all-day semantics through ICS', () => {
   const bitrixEvent = buildBitrixEventFromRaw({
     ATTENDEES: [{ EMAIL: 'guest@example.com', NAME: 'Guest', STATUS: 'ACCEPTED' }],

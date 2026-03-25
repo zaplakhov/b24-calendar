@@ -68,6 +68,9 @@ function buildFallbackBitrixEvent(eventId: string, draft: BitrixCalendarDraft, c
 
 export class BitrixService {
   private static readonly RATE_LIMIT_MAX_RETRIES = 4;
+  private static readonly RESOURCE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+  private readonly resourceNameCache = new Map<string, { expiresAt: number; values: Map<string, string> }>();
 
   public constructor(
     private readonly sqliteService: SQLiteService,
@@ -174,7 +177,70 @@ export class BitrixService {
       result,
     });
 
-     return (Array.isArray(result) ? result : []).map((item) => buildBitrixEventFromRaw((item ?? {}) as BitrixPayload));
+    const mappedEvents = (Array.isArray(result) ? result : []).map((item) => buildBitrixEventFromRaw((item ?? {}) as BitrixPayload));
+    await this.enrichResourceLocations(connectionId, mappedEvents);
+    return mappedEvents;
+  }
+
+  private async enrichResourceLocations(connectionId: string, events: BitrixCalendarEvent[]): Promise<void> {
+    const codedLocations = events
+      .map((event) => event.location)
+      .filter((location): location is string => Boolean(location && /^calendar_\d+_\d+$/i.test(location)));
+    if (codedLocations.length === 0) {
+      return;
+    }
+
+    const resourceMap = await this.getResourceNameMap(connectionId);
+    for (const event of events) {
+      const location = event.location;
+      if (!location) {
+        continue;
+      }
+
+      const locationMatch = location.match(/^calendar_\d+_(\d+)$/i);
+      if (!locationMatch) {
+        continue;
+      }
+
+      const resourceName = resourceMap.get(locationMatch[1]);
+      if (resourceName) {
+        event.location = resourceName;
+      }
+    }
+  }
+
+  private async getResourceNameMap(connectionId: string): Promise<Map<string, string>> {
+    const now = Date.now();
+    const cached = this.resourceNameCache.get(connectionId);
+    if (cached && cached.expiresAt > now) {
+      return cached.values;
+    }
+
+    try {
+      const resources = await this.call<unknown[]>(connectionId, 'calendar.resource.list', {});
+      const values = new Map<string, string>();
+      for (const item of Array.isArray(resources) ? resources : []) {
+        const payload = typeof item === 'object' && item ? item as Record<string, unknown> : {};
+        const id = payload.ID == null ? '' : String(payload.ID);
+        const name = payload.NAME == null ? '' : String(payload.NAME).trim();
+        if (id && name) {
+          values.set(id, name);
+        }
+      }
+
+      this.resourceNameCache.set(connectionId, {
+        expiresAt: now + BitrixService.RESOURCE_CACHE_TTL_MS,
+        values,
+      });
+      return values;
+    } catch (error: unknown) {
+      syncDebug({
+        connectionId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        phase: 'bitrix.resource.list.fallback',
+      });
+      return new Map();
+    }
   }
 
   public async fetchEventById(connectionId: string, eventId: string): Promise<BitrixCalendarEvent | null> {

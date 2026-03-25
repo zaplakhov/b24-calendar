@@ -234,7 +234,13 @@ function normalizeText(value: string | null | undefined): string | null {
 }
 
 function escapeIcsValue(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
+  return value
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\\/g, '\\\\')
+    .replace(/\n/g, '\\n')
+    .replace(/,/g, '\\,')
+    .replace(/;/g, '\\;');
 }
 
 function decodeIcsValue(value: string | null): string | null {
@@ -474,6 +480,10 @@ function parseBitrixAttendee(value: unknown): EventAttendee | null {
         ? parseMailtoValue(payload.mail)
         : typeof payload.MAIL === 'string'
           ? parseMailtoValue(payload.MAIL)
+          : typeof payload.userEmail === 'string'
+            ? parseMailtoValue(payload.userEmail)
+            : typeof payload.USER_EMAIL === 'string'
+              ? parseMailtoValue(payload.USER_EMAIL)
           : null;
   const name = typeof payload.name === 'string'
     ? normalizeText(payload.name)
@@ -499,7 +509,7 @@ function parseBitrixAttendee(value: unknown): EventAttendee | null {
       ? normalizeText(payload.STATUS)
       : null;
 
-  if (!email) {
+  if (!email && !name) {
     return null;
   }
 
@@ -734,10 +744,19 @@ export function normalizeBitrixEventForSync(
 }
 
 export function transformBitrixEventToYandexDraft(event: BitrixCalendarEvent): YandexCalendarDraft {
+  const attendeesWithEmail = event.attendees.filter((attendee) => Boolean(attendee.email));
+  const attendeeFallbackLines = event.attendees
+    .filter((attendee) => !attendee.email && attendee.name && attendee.name !== event.location)
+    .map((attendee) => `Участник: ${attendee.name}`);
+  const composedDescription = normalizeText([
+    normalizeText(event.description),
+    ...attendeeFallbackLines,
+  ].filter((line): line is string => Boolean(line)).join('\n'));
+
   return {
     uid: buildDeterministicUid(event.id),
     summary: event.title,
-    description: normalizeText(event.description),
+    description: composedDescription,
     startsAt: event.startsAt,
     endsAt: event.endsAt,
     isAllDay: event.isAllDay,
@@ -747,7 +766,7 @@ export function transformBitrixEventToYandexDraft(event: BitrixCalendarEvent): Y
     organizer: event.organizer,
     status: event.status,
     transparency: event.transparency,
-    attendees: event.attendees,
+    attendees: attendeesWithEmail,
     timezone: event.timezone ?? DEFAULT_TIMEZONE,
     preserved: defaultPreservedFields({
       ...event.preserved,
@@ -894,13 +913,17 @@ export function buildIcsEvent(draft: YandexCalendarDraft): string {
   }
 
   for (const attendee of draft.attendees) {
+    if (!attendee.email) {
+      continue;
+    }
+
     const params = [
       attendee.name ? `CN=${escapeIcsValue(attendee.name)}` : null,
       attendee.role ? `ROLE=${escapeIcsValue(attendee.role)}` : null,
       attendee.partstat ? `PARTSTAT=${escapeIcsValue(attendee.partstat)}` : null,
     ].filter((item): item is string => Boolean(item));
     const prefix = params.length > 0 ? `;${params.join(';')}` : '';
-    lines.push(`ATTENDEE${prefix}:mailto:${escapeIcsValue(attendee.email ?? 'unknown@example.invalid')}`);
+    lines.push(`ATTENDEE${prefix}:mailto:${escapeIcsValue(attendee.email)}`);
   }
 
   if (draft.recurrenceRule) {
